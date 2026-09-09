@@ -1,0 +1,15 @@
+﻿1. **Çalışanın kimlik bilgileri:** Adı, soyadı ve SGK no.
+2. **Ödeme dönemi:** Hakedişin hangi tarihler arasında geçerli olduğu.
+3. **Mali detaylar:** Brüt ücret, vergi/kesinti ve net ödenen tutar.
+
+----- yeni çıktı -----
+
+1. **Tarafların Bilgileri** (Alıcı/Üretici adı, Vergi No, Adres)
+2. **Dönem ve Tarih Detayları** (Raporun hazırlanma tarihi ve kapsadığı hesap dönemi)
+3. **Mali Tutarlar** (Tahakkuk edilen borç, ödenen miktar ve kalan bakiye)
+
+----- yeni çıktı -----
+
+1. **Periyot Bilgisi:** Raporu kapsayan tarih aralığı (başlangıç ve bitiş).
+2. **İş Detayları ve Tutarlar:** Tamamlanan işler, miktarları ve hesaplanan ödeme rakamı.
+3. **Onay Bölümü:** İlgili tarafların (hakediş veren/alın) imza veya onay bilgisi.
