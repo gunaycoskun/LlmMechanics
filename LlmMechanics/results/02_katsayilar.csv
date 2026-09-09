@@ -1,0 +1,2 @@
+﻿run_id,model,prefill_ms_per_in_token,prefill_kaynak,prefill_ttft_ms_per_in_token,prefill_ttft_r2,prefill_total_ms_per_in_token,prefill_total_r2,decode_ms_per_out_token,decode_r2,tok_per_sec,sabit_overhead_ms,b_kolu_kesisim_ms,out_in_maliyet_orani,n_ornek_per_nokta,a_kolu_temperature,b_kolu_temperature,uyarilar
+20260909-103150,qwen/qwen3.5-9b,0.19250,ttft,0.19250,0.9996,0.20498,0.9990,8.3949,1.0000,119.12,53.7,65.7,43.6,5,0.00,0.70,

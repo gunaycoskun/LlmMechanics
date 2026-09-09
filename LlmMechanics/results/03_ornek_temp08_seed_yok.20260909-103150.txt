@@ -1,0 +1,137 @@
+﻿# temp08_seed_yok — temp=0.8, seed=yok, n=20 — 20260909-103150
+
+----- çıktı 1/20 (content 136 kar, reasoning 2995 kar, finish=stop) -----
+
+1. İlgili tarafların (işçi/işveren) kimlik bilgileri,
+2. Hizmetin yapıldığı tarih ve süre aralığı,
+3. Net ödenmesi gereken toplam tutar.
+
+----- çıktı 2/20 (content 132 kar, reasoning 3836 kar, finish=stop) -----
+
+1. **İşçi/Personel Bilgileri** (Adı Soyadı, No)
+2. **Hakediş Dönemi** (Tarih aralığı)
+3. **Toplam Tutarlar** (Ödeme/Gider Kalemleri)
+
+----- çıktı 3/20 (content 301 kar, reasoning 3427 kar, finish=stop) -----
+
+Bir hakediş raporunda mutlaka bulunması gereken üç unsur:
+
+1.  **Taraf Bilgileri:** Siparişçi ve yüklenici firmaların adı, adresi ve vergi numarası.
+2.  **İşlem Detayları:** Yapılan hizmet veya malın açıklayıcı listesi ve miktarı.
+3.  **Finansal Bilgiler:** Toplam tutar, hakediş tarihi ve imza onayı.
+
+----- çıktı 4/20 (content 341 kar, reasoning 3867 kar, finish=stop) -----
+
+Bir hakediş raporunda mutlaka bulunması gereken üç temel unsur:
+
+1. **Dönem ve Proje Bilgileri:** Hangi iş için, hangi tarih aralığında hazırlanıp.
+2. **İş Detayları ve Maliyetler:** Yapılan çalışmaların listesi ile ödenmesi gereken tutarlar.
+3. **İmza ve Onay Alanı:** İlgili taraflarca (yapıcı, denetçi vb.) onaylanmasını sağlayan imzalar.
+
+----- çıktı 5/20 (content 214 kar, reasoning 3019 kar, finish=stop) -----
+
+Bir hakediş raporunda mutlaka bulunması gereken üç temel unsur şunlardır:
+
+1. **Personel Bilgileri** (Adı, soyadı ve kimlik numarası)
+2. **Brüt Kazanç ve Kesintiler** (Maaş, vergi, prim vb.)
+3. **Net Ödenen Tutar**
+
+----- çıktı 6/20 (content 84 kar, reasoning 3523 kar, finish=stop) -----
+
+1. Satıcı ve alıcı bilgileri,
+2. Rapor dönemi veya tarihi,
+3. Toplam ödenacak tutar.
+
+----- çıktı 7/20 (content 138 kar, reasoning 2716 kar, finish=stop) -----
+
+1. **Taraf Bilgileri** (Müşteri ve yüklenici adı),
+2. **İş Dönemi** (Yapılan işlerin tarihleri),
+3. **Mali Özet** (Ödenecek toplam tutar).
+
+----- çıktı 8/20 (content 0 kar, reasoning 7651 kar, finish=length) -----
+
+(boş)
+
+----- çıktı 9/20 (content 161 kar, reasoning 4513 kar, finish=stop) -----
+
+Bir hakediş raporunda mutlaka bulunması gereken üç unsur:
+
+1. İşlem ve dönem bilgisi,
+2. Tutarlar (Net, brüt ve vergi kesintileri),
+3. İmza veya elektronik onay.
+
+----- çıktı 10/20 (content 0 kar, reasoning 8002 kar, finish=length) -----
+
+(boş)
+
+----- çıktı 11/20 (content 107 kar, reasoning 3808 kar, finish=stop) -----
+
+1. Müşteri ve tedarikçi bilgileri.
+2. Hakediş numarası ve tarihi.
+3. Kalemler ile toplam tutar (KDV dahil).
+
+----- çıktı 12/20 (content 179 kar, reasoning 3504 kar, finish=stop) -----
+
+Bir hakediş raporunda mutlaka bulunması gereken üç unsur:
+
+1. Çalışan kimlik bilgileri (Ad, Soyad, T.C. No).
+2. Dönemsel çalışma süresi.
+3. Brüt/Net ücret tutarları ve kesintiler.
+
+----- çıktı 13/20 (content 93 kar, reasoning 2324 kar, finish=stop) -----
+
+1. Hakediş numarası ve tarihi
+2. Toplam tutar (net ve KDV dahil)
+3. Alıcı ve satıcı bilgileri
+
+----- çıktı 14/20 (content 137 kar, reasoning 2624 kar, finish=stop) -----
+
+1. **Şirket/Birim bilgileri** (Kimin hakedişi?)
+2. **Hakediş dönemi** (Hangi tarih aralığı?)
+3. **Toplam net tutar** (Ne kadar ödenmeli?)
+
+----- çıktı 15/20 (content 176 kar, reasoning 3170 kar, finish=stop) -----
+
+Bir hakediş raporunda mutlaka bulunması gereken üç unsur:
+
+1. **İlgili işveren ve müşteri bilgileri**
+2. **Hakediş dönemi (tarih aralığı)**
+3. **Toplam ödenmesi gereken tutar**
+
+----- çıktı 16/20 (content 174 kar, reasoning 4805 kar, finish=stop) -----
+
+Bir hakediş raporunda mutlaka bulunması gereken üç unsur:
+
+1. **Yapılan işlerin detayı ve hesaplanan tutar**
+2. **Raporun tarihi**
+3. **Yetkili imza (ve tarafların bilgisi)**
+
+----- çıktı 17/20 (content 230 kar, reasoning 3311 kar, finish=stop) -----
+
+Bir hakediş raporunda mutlaka bulunması gereken üç unsur:
+
+1.  **İşlenen işin tanımı** (Ne yapıldı?)
+2.  **Miktar ve birim fiyat bilgisi** (Kaçını, ne kadar tutuyor?)
+3.  **Toplam tutar ve tarih** (Toplam ödenek ve raporlama günü)
+
+----- çıktı 18/20 (content 227 kar, reasoning 3402 kar, finish=stop) -----
+
+Bir hakediş raporunda mutlaka bulunması gereken üç unsur:
+
+1. Hizmetin kapsadığı dönem (tarih aralığı) ve detayları,
+2. İlgili tarafların kimlik bilgileri (İşveren ve hizmet veren),
+3. Ödenmesi gereken toplam tutar (KDV dahil).
+
+----- çıktı 19/20 (content 239 kar, reasoning 5529 kar, finish=stop) -----
+
+1. **İş Dönemi/Tarihi:** Hakedişin hangi süre için yapıldığını belirten tarihler.
+2. **Yapılan İş Detayları:** Hizmet veya malzemelerin listesi ve miktarları.
+3. **Tutar ve İmza/Onay:** Toplam ödenecek rakam ve yetkilendirilmiş imza/onayı.
+
+----- çıktı 20/20 (content 156 kar, reasoning 4870 kar, finish=stop) -----
+
+Bir hakediş raporunda mutlaka bulunması gereken üç unsur:
+
+1. **Yapılan işin detayı ve kapsamı**
+2. **Hesaplanan tutarlar (KDV dahil)**
+3. **İmza ve tarih**

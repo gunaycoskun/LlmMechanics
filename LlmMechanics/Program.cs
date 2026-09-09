@@ -10,12 +10,14 @@
 // v2'de düzeltilenler:
 //   1. reasoning_content ayrı kanal olarak okunuyor (stream + non-stream)
 //   2. İki ayrı TTFT: TtftAny (fiziksel prefill) / TtftContent (algılanan gecikme)
-//   3. enable_thinking=false ile ölçüm koşularında düşünme kapatılabiliyor
-//      (+ /no_think fallback'i, ön kontrolle doğrulanıyor)
+//   3. Düşünmeyi kapatmak için üç yol DENENİYOR ve sonucu ön kontrolde
+//      raporlanıyor: chat_template_kwargs.enable_thinking, /no_think sistem
+//      mesajı, ve (LM Studio tarafında) Reasoning Budget. qwen3.5-9b üzerinde
+//      ÜÇÜ DE ETKİSİZ — kod bunu tespit edip ölçümleri düşünme açık koşuyor.
 //   4. Deney 2 A kolu max_tokens 16 -> 64 (marjsız değildi)
 //   5. Deney 4 uzun context'e taşındı (kısa prompt'ta KV cache etkisi gürültüdeydi)
 //   6. Deney 5'e 16 paralellik seviyesi eklendi (eğri doymamıştı)
-//   7. Deney 6 hem düşünme açık hem kapalı koşuyor
+//   7. Deney 6 düşünme kapatılabiliyorsa iki kol, kapatılamıyorsa tek kol koşuyor
 //
 // Bağımlılık yok. Ham HttpClient kullanıyoruz çünkü abstraction, tam da
 // ölçmek istediğimiz sağlayıcı farklarını normalize eder.
@@ -32,20 +34,54 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-var config = Config.Parse(args);
 Console.OutputEncoding = Encoding.UTF8;
+
+Config config;
+try
+{
+    config = Config.Parse(args);
+}
+catch (ArgumentException ex)
+{
+    Console.Error.WriteLine(ex.Message);
+    Console.Error.WriteLine();
+    Console.Error.WriteLine(Config.Usage);
+    return 1;
+}
 
 using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
 var client = new LmClient(http, config.BaseUrl, config.ModelId);
 
-Directory.CreateDirectory(config.OutputDir);
+try
+{
+    Directory.CreateDirectory(config.OutputDir);
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"HATA: çıktı klasörü oluşturulamadı ({config.OutputDir}) — {ex.Message}");
+    return 1;
+}
 
 Console.WriteLine($"Base URL : {config.BaseUrl}");
 Console.WriteLine($"Model    : {(string.IsNullOrWhiteSpace(config.ModelId) ? "(otomatik keşif)" : config.ModelId)}");
 
 if (string.IsNullOrWhiteSpace(config.ModelId))
 {
-    var models = await client.ListModelsAsync();
+    List<string> models;
+    try
+    {
+        models = await client.ListModelsAsync();
+    }
+    catch (Exception ex)
+    {
+        // Buraya gelen istisna eskiden yakalanmıyordu: LM Studio kapalıyken
+        // program yığın iziyle düşüyor, aşağıdaki yardımcı mesaj hiç görünmüyordu.
+        Console.Error.WriteLine($"HATA: model listesi alınamadı — {ex.Message}");
+        Console.Error.WriteLine($"      Sunucu adresi: {config.BaseUrl}");
+        Console.Error.WriteLine("      LM Studio > Developer > Status: Running ve model yüklü olmalı.");
+        return 1;
+    }
+
     if (models.Count == 0)
     {
         Console.Error.WriteLine("HATA: Sunucuda model yok. LM Studio > Developer > Status: Running ve model yüklü olmalı.");
@@ -55,15 +91,24 @@ if (string.IsNullOrWhiteSpace(config.ModelId))
     Console.WriteLine("\nBulunan modeller:");
     foreach (var m in models) Console.WriteLine($"  - {m}");
 
+    // Yalnızca 'embed' elemek yetmiyordu; rerank/whisper gibi chat olmayan
+    // modeller filtreyi geçip sessizce seçilebiliyordu.
+    string[] notChat = ["embed", "rerank", "whisper", "clip", "vae", "tts"];
+
     var chatCandidates = models
-        .Where(m => !m.Contains("embed", StringComparison.OrdinalIgnoreCase))
+        .Where(m => !notChat.Any(t => m.Contains(t, StringComparison.OrdinalIgnoreCase)))
         .ToList();
 
     if (chatCandidates.Count == 0)
     {
-        Console.Error.WriteLine("HATA: Chat modeli bulunamadı (hepsi embedding görünüyor).");
+        Console.Error.WriteLine("HATA: Chat modeli bulunamadı (hepsi embedding/rerank görünüyor).");
+        Console.Error.WriteLine("      --model ile açıkça belirt.");
         return 1;
     }
+
+    if (chatCandidates.Count > 1)
+        Console.WriteLine($"UYARI: {chatCandidates.Count} chat adayı var, ilki seçiliyor. " +
+                          "Koşular arası tutarlılık için --model kullan.");
 
     client.ModelId = chatCandidates[0];
     Console.WriteLine($"\nSeçilen chat modeli: {client.ModelId}");
@@ -78,43 +123,103 @@ Console.WriteLine($"Run ID   : {runId}");
 // Bunu ölçümden ÖNCE doğruluyoruz. v1'in tüm hatası "varsaydım" yüzündendi.
 // ----------------------------------------------------------------------------
 
+// Warm-up ÖN KONTROLDEN ÖNCE: ilk çağrı model yükleme + CUDA context init +
+// kernel derlemesi maliyetini üstleniyor. Ön kontrol önce koşarsa bastığı
+// ttftAny bu soğuk maliyeti gösterir (ölçülen fark 2413 ms'e karşı 65 ms) ve
+// kullanıcı yanlış bir taban çizgisi okur.
+Console.WriteLine("\nWarm-up (3 çağrı, ölçüme dahil değil)...");
+try
+{
+    for (var i = 0; i < 3; i++)
+        await client.ChatAsync([new Message("user", "Merhaba.")], 16, 0, disableThinking: true);
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"\nHATA: warm-up çağrısı başarısız — {ex.Message}");
+    Console.Error.WriteLine($"      Sunucuya ulaşılamıyor olabilir: {config.BaseUrl}");
+    Console.Error.WriteLine("      LM Studio > Developer > Status: Running ve model yüklü mü?");
+    return 1;
+}
+Console.WriteLine("Warm-up tamam.");
+
 Header("ÖN KONTROL — reasoning kanalı ve enable_thinking");
 
-var probeOn = await client.ChatStreamAsync(
-    [new Message("user", "Hakediş nedir? Tek cümle.")], maxTokens: 300, temperature: 0);
+const string probePrompt = "Hakediş nedir? Tek cümle.";
 
-Console.WriteLine($"Düşünme AÇIK  : content={probeOn.Text.Length} kar, " +
-                  $"reasoning={probeOn.Reasoning.Length} kar, " +
-                  $"reasoning_tokens={probeOn.ReasoningTokens}, " +
-                  $"ttftAny={probeOn.TtftAnyMs:F0}ms, ttftContent={Fmt(probeOn.TtftContentMs)}");
+StreamResult probeOn, probeOff;
+try
+{
+    probeOn = await client.ChatStreamAsync(
+        [new Message("user", probePrompt)], maxTokens: 300, temperature: 0);
 
-var probeOff = await client.ChatStreamAsync(
-    [new Message("user", "Hakediş nedir? Tek cümle.")], maxTokens: 300, temperature: 0,
-    disableThinking: true);
+    Console.WriteLine($"Düşünme AÇIK  : content={probeOn.Text.Length} kar, " +
+                      $"reasoning={probeOn.Reasoning.Length} kar, " +
+                      $"reasoning_tokens={probeOn.ReasoningTokens}, " +
+                      $"ttftAny={Fmt(probeOn.TtftAnyMs)}, ttftContent={Fmt(probeOn.TtftContentMs)}");
 
-Console.WriteLine($"Düşünme KAPALI: content={probeOff.Text.Length} kar, " +
-                  $"reasoning={probeOff.Reasoning.Length} kar, " +
-                  $"reasoning_tokens={probeOff.ReasoningTokens}, " +
-                  $"ttftAny={probeOff.TtftAnyMs:F0}ms, ttftContent={Fmt(probeOff.TtftContentMs)}");
+    probeOff = await client.ChatStreamAsync(
+        [new Message("user", probePrompt)], maxTokens: 300, temperature: 0,
+        disableThinking: true);
 
-var thinkingOff = probeOff.Reasoning.Length == 0 && probeOff.Text.Length > 0;
+    Console.WriteLine($"Düşünme KAPALI: content={probeOff.Text.Length} kar, " +
+                      $"reasoning={probeOff.Reasoning.Length} kar, " +
+                      $"reasoning_tokens={probeOff.ReasoningTokens}, " +
+                      $"ttftAny={Fmt(probeOff.TtftAnyMs)}, ttftContent={Fmt(probeOff.TtftContentMs)}");
+}
+catch (Exception ex)
+{
+    Console.Error.WriteLine($"\nHATA: ön kontrol çağrısı başarısız — {ex.Message}");
+    Console.Error.WriteLine($"      Sunucuya ulaşılamıyor olabilir: {config.BaseUrl}");
+    Console.Error.WriteLine("      LM Studio > Developer > Status: Running ve model yüklü mü?");
+    return 1;
+}
+
+// Bazı sunucular reasoning'i ayrı alanda değil, content içinde <think>...</think>
+// olarak yayınlıyor. Bunu kontrol etmezsek "düşünme kapandı" diye yanlış karar
+// verir, ttftAny'yi ilk content token'ına damgalar ve tüm katsayıları kirletiriz.
+var inlineThink = probeOff.Text.Contains("<think", StringComparison.OrdinalIgnoreCase);
+
+if (inlineThink)
+    Console.WriteLine("UYARI: content içinde <think> bloğu görüldü — reasoning ayrı kanalda gelmiyor.");
+
+var thinkingOff = probeOff.Reasoning.Length == 0 && probeOff.Text.Length > 0 && !inlineThink;
+client.CanDisableThinking = thinkingOff;
 
 if (!thinkingOff)
 {
     Console.WriteLine();
     Console.WriteLine("UYARI: enable_thinking=false etkisiz. /no_think fallback'i deneniyor...");
-    client.UseNoThinkFallback = false;
+
+    // DİKKAT: burası bir zamanlar `= false` yazıyordu; property'nin varsayılanı da
+    // false olduğu için fallback hiç devreye girmiyor, aşağıdaki probe da birebir
+    // aynı isteği tekrarlıyordu — yani "fallback işe yaramadı" sonucu denenmemiş
+    // bir yoldan çıkarılmış oluyordu.
+    client.UseNoThinkFallback = true;
 
     var probeOff2 = await client.ChatStreamAsync(
-        [new Message("user", "Hakediş nedir? Tek cümle.")], maxTokens: 300, temperature: 0,
+        [new Message("user", probePrompt)], maxTokens: 300, temperature: 0,
         disableThinking: true);
 
     Console.WriteLine($"Fallback ile  : content={probeOff2.Text.Length} kar, " +
                       $"reasoning={probeOff2.Reasoning.Length} kar");
 
-    if (probeOff2.Reasoning.Length > 0)
+    var fallbackWorks = probeOff2.Reasoning.Length == 0 && probeOff2.Text.Length > 0
+                        && !probeOff2.Text.Contains("<think", StringComparison.OrdinalIgnoreCase);
+
+    client.CanDisableThinking = fallbackWorks;
+
+    if (fallbackWorks)
     {
-        Console.WriteLine("       Fallback da işe yaramadı. Ölçümler düşünme AÇIK koşacak.");
+        Console.WriteLine("       /no_think fallback'i ÇALIŞIYOR, ölçümlerde kullanılacak.");
+        Console.WriteLine("       Not: bu her prompt'a sabit bir system turu ekler ve Deney 1'in");
+        Console.WriteLine("       token sayılarını iki tarafta da şişirir (oranı 1'e yaklaştırır).");
+    }
+    else
+    {
+        // Geri al. Açık bırakılırsa hiçbir fayda sağlamadan bütün prompt'lara
+        // sabit bir system turu ekler — Deney 1'in TR/EN oranını bozan tam da bu.
+        client.UseNoThinkFallback = false;
+        Console.WriteLine("       Fallback da işe yaramadı, geri alındı. Ölçümler düşünme AÇIK koşacak.");
         Console.WriteLine("       README'ye bu notu düş — katsayılar reasoning dahil demektir.");
     }
 }
@@ -126,29 +231,46 @@ if (probeOn.Text.Length == 0 && probeOn.Reasoning.Length == 0)
 }
 
 // ----------------------------------------------------------------------------
-// Warm-up — ölçüme dahil DEĞİL
-//
-// İlk çağrılar model yükleme, CUDA context init ve kernel derlemesini içerir.
-// Gemini'de bu maliyet yoktu (sunucu zaten sıcaktı); lokalde en büyük outlier
-// kaynağı bu.
+// Not: warm-up yukarıda, ön kontrolden ÖNCE koşuyor — ilk çağrılar model
+// yükleme, CUDA context init ve kernel derlemesini içerir. Gemini'de bu maliyet
+// yoktu (sunucu zaten sıcaktı); lokalde en büyük outlier kaynağı bu.
 // ----------------------------------------------------------------------------
 
-Console.WriteLine("\nWarm-up (3 çağrı, ölçüme dahil değil)...");
-for (var i = 0; i < 3; i++)
-    await client.ChatAsync([new Message("user", "Merhaba.")], 16, 0, disableThinking: true);
-Console.WriteLine("Warm-up tamam.");
-
-// ----------------------------------------------------------------------------
-
+// Her deney kendi try/catch'inde koşuyor: Deney 2'de 50, Deney 3'te 80 sıralı
+// çağrı var; birinde 500 alınca tüm koşunun çöpe gitmesi ve sonraki deneylerin
+// hiç koşmaması ölçüm saatlerini yakıyordu.
 var sel = config.Experiments;
-if (sel.Contains(1)) await Experiment1_Tokenization(client, config, runId);
-if (sel.Contains(2)) await Experiment2_PrefillDecode(client, config, runId);
-if (sel.Contains(3)) await Experiment3_Determinism(client, config, runId);
-if (sel.Contains(4)) await Experiment4_KvCache(client, config, runId);
-if (sel.Contains(5)) await Experiment5_Concurrency(client, config, runId);
-if (sel.Contains(6)) await Experiment6_QualitySpotCheck(client, config, runId);
+var failedExperiments = new List<int>();
+
+if (sel.Contains(1)) await Run(1, () => Experiment1_Tokenization(client, config, runId));
+if (sel.Contains(2)) await Run(2, () => Experiment2_PrefillDecode(client, config, runId));
+if (sel.Contains(3)) await Run(3, () => Experiment3_Determinism(client, config, runId));
+if (sel.Contains(4)) await Run(4, () => Experiment4_KvCache(client, config, runId));
+if (sel.Contains(5)) await Run(5, () => Experiment5_Concurrency(client, config, runId));
+if (sel.Contains(6)) await Run(6, () => Experiment6_QualitySpotCheck(client, config, runId));
+
+async Task Run(int no, Func<Task> body)
+{
+    try
+    {
+        await body();
+    }
+    catch (Exception ex)
+    {
+        failedExperiments.Add(no);
+        Console.Error.WriteLine($"\nHATA: Deney {no} yarıda kaldı — {ex.GetType().Name}: {ex.Message}");
+        Console.Error.WriteLine("      Bu deneyin CSV'si yazılmadı. Sonraki deneylere devam ediliyor.");
+    }
+}
 
 Console.WriteLine($"\nTamamlandı. Çıktılar: {Path.GetFullPath(config.OutputDir)}");
+
+if (failedExperiments.Count > 0)
+{
+    Console.Error.WriteLine($"UYARI: başarısız deneyler: {string.Join(", ", failedExperiments)}");
+    return 2;
+}
+
 return 0;
 
 
@@ -202,9 +324,27 @@ static async Task Experiment1_Tokenization(LmClient client, Config config, strin
          "days from the end of the event causing the delay, and its justifications shall be documented."),
     };
 
+    // --- Şablon sabiti kalibrasyonu ---
+    // Yorumdaki "~15-20 token" şimdiye kadar ÖLÇÜLMEMİŞ bir varsayımdı. Tek
+    // karakterlik bir prompt gönderip prompt_tokens'ı okuyoruz: kalan her şey
+    // chat template overhead'i. Bu sabit hem payı hem paydayı şişirdiği için
+    // ölçülen oranı 1'e doğru itiyor; ölçmeden "alt sınır" demek yetersizdi.
+    var calib = await client.ChatAsync([new Message("user", ".")], 1, 0, disableThinking: true);
+    var templateOverhead = Math.Max(0, calib.PromptTokens - 1);
+
+    Console.WriteLine($"Şablon sabiti (ölçülen): {templateOverhead} token " +
+                      $"(tek karakterlik prompt = {calib.PromptTokens} prompt_tokens)");
+    Console.WriteLine();
+
     var rows = new List<string[]>();
-    Console.WriteLine($"{"metin",-18} {"TR tok",8} {"EN tok",8} {"oran",8} {"TR kar",8} {"EN kar",8}");
-    Console.WriteLine(new string('-', 62));
+
+    // Özet istatistikler CSV'ye yazılmış STRING'lerden sabit indekslerle geri
+    // parse ediliyordu; kolon eklendiğinde indeks kaydı ve derleyici uyarmadan
+    // yanlış kolonun ortalaması raporlandı. Ölçümleri tipli tutuyoruz.
+    var measured = new List<(double Ratio, double NetRatio, int TrTok, int EnTok)>();
+
+    Console.WriteLine($"{"metin",-18} {"TR tok",8} {"EN tok",8} {"oran",8} {"net oran",9} {"TR kar",8} {"EN kar",8}");
+    Console.WriteLine(new string('-', 72));
 
     foreach (var (name, tr, en) in pairs)
     {
@@ -213,31 +353,56 @@ static async Task Experiment1_Tokenization(LmClient client, Config config, strin
         var trRes = await client.ChatAsync([new Message("user", tr)], 1, 0, disableThinking: true);
         var enRes = await client.ChatAsync([new Message("user", en)], 1, 0, disableThinking: true);
 
-        var ratio = (double)trRes.PromptTokens / Math.Max(enRes.PromptTokens, 1);
+        if (trRes.PromptTokens == 0 || enRes.PromptTokens == 0)
+            throw new InvalidOperationException(
+                $"'{name}' için prompt_tokens 0 geldi — sunucu usage alanını göndermiyor, " +
+                "bu deneyin tüm oranları anlamsız olurdu.");
 
-        Console.WriteLine($"{name,-18} {trRes.PromptTokens,8} {enRes.PromptTokens,8} {ratio,8:F3} {tr.Length,8} {en.Length,8}");
+        var ratio = (double)trRes.PromptTokens / enRes.PromptTokens;
+
+        // Şablon sabitinden arındırılmış oran: asıl metin-içi ceza bu.
+        var trNet = Math.Max(1, trRes.PromptTokens - templateOverhead);
+        var enNet = Math.Max(1, enRes.PromptTokens - templateOverhead);
+        var netRatio = (double)trNet / enNet;
+
+        Console.WriteLine($"{name,-18} {trRes.PromptTokens,8} {enRes.PromptTokens,8} {ratio,8:F3} " +
+                          $"{netRatio,9:F3} {tr.Length,8} {en.Length,8}");
 
         rows.Add([
             runId, client.ModelId, name,
             trRes.PromptTokens.ToString(), enRes.PromptTokens.ToString(),
             Inv(ratio, "F4"),
             tr.Length.ToString(), en.Length.ToString(),
-            Inv((double)tr.Length / Math.Max(trRes.PromptTokens, 1), "F3"),
-            Inv((double)en.Length / Math.Max(enRes.PromptTokens, 1), "F3"),
+            Inv((double)tr.Length / trRes.PromptTokens, "F3"),
+            Inv((double)en.Length / enRes.PromptTokens, "F3"),
+            templateOverhead.ToString(),
+            trNet.ToString(), enNet.ToString(), Inv(netRatio, "F4"),
         ]);
+
+        measured.Add((ratio, netRatio, trRes.PromptTokens, enRes.PromptTokens));
     }
 
-    var avg = rows.Average(r => double.Parse(r[5], CultureInfo.InvariantCulture));
-    var max = rows.Max(r => double.Parse(r[5], CultureInfo.InvariantCulture));
+    // Üç ayrı toplama, üçü de farklı bir soruya cevap veriyor. Tek sayı raporlamak
+    // hangisinin kastedildiğini belirsiz bırakıyordu.
+    var avg = measured.Average(m => m.Ratio);                                            // makro
+    var max = measured.Max(m => m.Ratio);
+    var trTotal = measured.Sum(m => m.TrTok);
+    var enTotal = measured.Sum(m => m.EnTok);
+    var micro = (double)trTotal / Math.Max(enTotal, 1);                                  // token ağırlıklı
+    var netAvg = measured.Average(m => m.NetRatio);                                      // şablondan arındırılmış
+    var netMax = measured.Max(m => m.NetRatio);
 
-    Console.WriteLine(new string('-', 62));
-    Console.WriteLine($"Ortalama TR/EN oranı: {avg:F3}   |   En kötü durum: {max:F3}");
+    Console.WriteLine(new string('-', 72));
+    Console.WriteLine($"Ham oran      : ortalama {avg:F3} | en kötü {max:F3} | token-ağırlıklı {micro:F3}");
+    Console.WriteLine($"Net oran      : ortalama {netAvg:F3} | en kötü {netMax:F3}   (şablon sabiti çıkarılmış)");
     Console.WriteLine("Gemini referansı: 1.33. Chunk boyutu hesabını ORTALAMAYA değil");
     Console.WriteLine("EN KÖTÜ DURUMA göre yap — terim yoğun listeler en pahalı metin tipi.");
+    Console.WriteLine("Chunk planı için NET en kötü durumu kullan: gerçek metin-içi ceza odur.");
 
     Csv.Write(config, "01_tokenization",
         ["run_id", "model", "metin", "tr_tokens", "en_tokens", "oran",
-         "tr_karakter", "en_karakter", "tr_kar_per_token", "en_kar_per_token"],
+         "tr_karakter", "en_karakter", "tr_kar_per_token", "en_kar_per_token",
+         "sablon_sabiti_token", "tr_net_tokens", "en_net_tokens", "net_oran"],
         rows);
 }
 
@@ -270,9 +435,37 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
     var inputSizes = new[] { 1, 20, 100, 400, 1200 };      // yaklaşık kelime
     var outputSizes = new[] { 32, 64, 128, 256, 512 };     // token
 
-    Console.WriteLine($"A kolu — input DEĞİŞKEN, output sabit ({aOutTokens} token):");
-    Console.WriteLine($"{"in_tok",8} {"out_tok",8} {"ttftAny",10} {"total_p50",10} {"total_p95",10}");
-    Console.WriteLine(new string('-', 50));
+    const double aTemp = 0.0;
+    const double bTemp = 0.7;
+
+    // Ölçüm noktası -> satır. Kolonlar 3..7 arası indeksleri aşağıdaki regresyon
+    // kullandığı için sabit; yeni kolonlar SONA ekleniyor.
+    void AddRow(string arm, double temp, List<StreamResult> samples, double inTok, double outTok)
+    {
+        // ttftAny ölçülemeyen örnekleri (hiç chunk ayrıştırılamadı) dışarıda
+        // bırakıyoruz; totalMs'e düşürüp ortalamaya karıştırmak v1'in ttft==total
+        // hatasını sessizce geri getiriyordu.
+        var ttfts = samples.Where(s => s.TtftAnyMs >= 0).Select(s => s.TtftAnyMs).ToList();
+        var ttft = ttfts.Count > 0 ? Stats.Median(ttfts) : -1;
+
+        rows.Add([
+            runId, client.ModelId, arm, Inv(inTok, "F1"), Inv(outTok, "F1"),
+            Inv(ttft, "F2"),
+            Inv(Stats.Median(samples.Select(s => s.TotalMs)), "F2"),
+            Inv(Stats.Percentile(samples.Select(s => s.TotalMs), 95), "F2"),
+            Inv(temp, "F2"),
+            samples.Count.ToString(),
+            ttfts.Count.ToString(),
+            samples.Min(s => s.CompletionTokens).ToString(),
+            samples.Max(s => s.CompletionTokens).ToString(),
+            samples.Count(s => s.CompletionTokensEstimated).ToString(),
+            samples.Count(s => s.FinishReason == "length").ToString(),
+        ]);
+    }
+
+    Console.WriteLine($"A kolu — input DEĞİŞKEN, output sabit ({aOutTokens} token tavanı), temperature={aTemp}:");
+    Console.WriteLine($"{"in_tok",8} {"out_tok",8} {"out±",8} {"ttftAny",10} {"total_p50",10} {"total_p95",10}");
+    Console.WriteLine(new string('-', 60));
 
     foreach (var size in inputSizes)
     {
@@ -284,22 +477,23 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
             // hızlanma ölçeriz. Cache etkisini Deney 4'te BİLEREK ölçüyoruz.
             var prompt = $"[{Guid.NewGuid():N}] " + Filler(size) + "\nBu metni tek kelimeyle özetle.";
             samples.Add(await client.ChatStreamAsync(
-                [new Message("user", prompt)], aOutTokens, 0, disableThinking: true));
+                [new Message("user", prompt)], aOutTokens, aTemp, disableThinking: true));
         }
 
-        var ttft = Stats.Median(samples.Select(s => s.TtftAnyMs));
+        var ttftVals = samples.Where(s => s.TtftAnyMs >= 0).Select(s => s.TtftAnyMs).ToList();
+        var ttft = ttftVals.Count > 0 ? Stats.Median(ttftVals) : -1;
         var p50 = Stats.Median(samples.Select(s => s.TotalMs));
         var p95 = Stats.Percentile(samples.Select(s => s.TotalMs), 95);
-        var inTok = (int)samples.Average(s => s.PromptTokens);
-        var outTok = (int)samples.Average(s => s.CompletionTokens);
+        var inTok = samples.Average(s => (double)s.PromptTokens);
+        var outTok = samples.Average(s => (double)s.CompletionTokens);
+        var outSpread = samples.Max(s => s.CompletionTokens) - samples.Min(s => s.CompletionTokens);
 
-        Console.WriteLine($"{inTok,8} {outTok,8} {ttft,10:F1} {p50,10:F1} {p95,10:F1}");
+        Console.WriteLine($"{inTok,8:F0} {outTok,8:F1} {outSpread,8} {Fmt(ttft),10} {p50,10:F1} {p95,10:F1}");
 
-        rows.Add([runId, client.ModelId, "A_prefill", inTok.ToString(), outTok.ToString(),
-                  Inv(ttft, "F2"), Inv(p50, "F2"), Inv(p95, "F2")]);
+        AddRow("A_prefill", aTemp, samples, inTok, outTok);
     }
 
-    Console.WriteLine("\nB kolu — input sabit (kısa), output DEĞİŞKEN:");
+    Console.WriteLine($"\nB kolu — input sabit (kısa), output DEĞİŞKEN, temperature={bTemp}:");
     Console.WriteLine($"{"in_tok",8} {"out_tok",8} {"ttftAny",10} {"total_p50",10} {"tok/s",10}");
     Console.WriteLine(new string('-', 50));
 
@@ -310,65 +504,125 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
         {
             var prompt = $"[{Guid.NewGuid():N}] Şantiye güvenliği hakkında uzun bir metin yaz.";
             samples.Add(await client.ChatStreamAsync(
-                [new Message("user", prompt)], size, 0.7, disableThinking: true));
+                [new Message("user", prompt)], size, bTemp, disableThinking: true));
         }
 
-        var ttft = Stats.Median(samples.Select(s => s.TtftAnyMs));
+        var ttftVals = samples.Where(s => s.TtftAnyMs >= 0).Select(s => s.TtftAnyMs).ToList();
+        var ttft = ttftVals.Count > 0 ? Stats.Median(ttftVals) : -1;
         var p50 = Stats.Median(samples.Select(s => s.TotalMs));
-        var p95 = Stats.Percentile(samples.Select(s => s.TotalMs), 95);
-        var outTok = (int)samples.Average(s => s.CompletionTokens);
-        var inTok = (int)samples.Average(s => s.PromptTokens);
+        var outTok = samples.Average(s => (double)s.CompletionTokens);
+        var inTok = samples.Average(s => (double)s.PromptTokens);
 
         // Bölme koruması: ttft ile total çakışırsa (v1'deki hata) sonsuz yazma.
-        var span = p50 - ttft;
+        var span = ttft >= 0 ? p50 - ttft : -1;
         var tpsText = span > 1.0 ? $"{outTok / (span / 1000.0):F1}" : "n/a";
 
-        Console.WriteLine($"{inTok,8} {outTok,8} {ttft,10:F1} {p50,10:F1} {tpsText,10}");
+        Console.WriteLine($"{inTok,8:F0} {outTok,8:F1} {Fmt(ttft),10} {p50,10:F1} {tpsText,10}");
 
-        rows.Add([runId, client.ModelId, "B_decode", inTok.ToString(), outTok.ToString(),
-                  Inv(ttft, "F2"), Inv(p50, "F2"), Inv(p95, "F2")]);
+        AddRow("B_decode", bTemp, samples, inTok, outTok);
     }
 
     // --- Katsayı çıkarımı ---
     // b (decode): B kolunda total'i output_tokens'a regresyon et.
-    // a (prefill): A kolunda total'i input_tokens'a regresyon et.
-    // A kolunun kesişimi b*64 + sabit overhead'i içerir; ayrıştırıyoruz.
+    // a (prefill): A kolunda input_tokens'a regresyon et — İKİ kez.
+    //
+    //   a_total : total_p50 üzerinden (eski davranış, karşılaştırılabilirlik için)
+    //   a_ttft  : ttft_any_p50 üzerinden (temiz ölçüm)
+    //
+    // İkisi neden farklı: A kolunda max_tokens bir TAVAN, sabit değil. Çıktı
+    // uzunluğu input ile birlikte oynarsa decode terimi total'e dayalı eğime
+    // sızar (atlanmış-değişken sapması). ttftAny prefill'in bittiği anı damgalar
+    // ve decode'dan tamamen bağımsızdır — prefill katsayısının doğru ölçüm aracı
+    // budur. Farkın büyük olması çıktı uzunluğunun sabit olmadığını gösterir.
 
     var aRows = rows.Where(r => r[2] == "A_prefill").ToList();
     var bRows = rows.Where(r => r[2] == "B_decode").ToList();
 
-    var (b, bIntercept) = Stats.LinearFit(
-        bRows.Select(r => (double)int.Parse(r[4])),
-        bRows.Select(r => double.Parse(r[6], CultureInfo.InvariantCulture)));
+    static double Col(string[] r, int i) => double.Parse(r[i], CultureInfo.InvariantCulture);
 
-    var (a, aIntercept) = Stats.LinearFit(
-        aRows.Select(r => (double)int.Parse(r[3])),
-        aRows.Select(r => double.Parse(r[6], CultureInfo.InvariantCulture)));
+    var bX = bRows.Select(r => Col(r, 4)).ToArray();
+    var bY = bRows.Select(r => Col(r, 6)).ToArray();
+    var (b, bIntercept) = Stats.LinearFit(bX, bY);
+    var bR2 = Stats.RSquared(bX, bY, b, bIntercept);
 
-    var aAvgOut = aRows.Average(r => (double)int.Parse(r[4]));
-    var pureOverhead = aIntercept - b * aAvgOut;
-    var ratio = a > 1e-9 ? b / a : 0;
+    var aX = aRows.Select(r => Col(r, 3)).ToArray();
+    var aYtotal = aRows.Select(r => Col(r, 6)).ToArray();
+    var (aTotal, aTotalIntercept) = Stats.LinearFit(aX, aYtotal);
+    var aTotalR2 = Stats.RSquared(aX, aYtotal, aTotal, aTotalIntercept);
 
-    Console.WriteLine(new string('-', 50));
-    Console.WriteLine($"Prefill (a) : {a:F4} ms / input token");
-    Console.WriteLine($"Decode  (b) : {b:F3} ms / output token   (~{(b > 0 ? 1000 / b : 0):F1} tok/s)");
+    var ttftRows = aRows.Where(r => Col(r, 5) >= 0).ToList();
+    var aTtftX = ttftRows.Select(r => Col(r, 3)).ToArray();
+    var aTtftY = ttftRows.Select(r => Col(r, 5)).ToArray();
+    var (aTtft, aTtftIntercept) = Stats.LinearFit(aTtftX, aTtftY);
+    var aTtftR2 = Stats.RSquared(aTtftX, aTtftY, aTtft, aTtftIntercept);
+
+    // Prefill katsayısı olarak ttft'ye dayalı olanı kullanıyoruz; ölçülemediyse
+    // (hiç ttft yoksa) eskisine düşüyoruz ve bunu açıkça söylüyoruz.
+    var aFromTtft = aTtftX.Length >= 2 && aTtft > 0;
+    var a = aFromTtft ? aTtft : aTotal;
+
+    var aAvgOut = aRows.Average(r => Col(r, 4));
+    var pureOverhead = aTotalIntercept - b * aAvgOut;
+    var ratio = a > 1e-9 ? b / a : double.NaN;
+
+    Console.WriteLine(new string('-', 60));
+    Console.WriteLine($"Prefill (a) : {a:F4} ms / input token   [{(aFromTtft ? "ttft tabanlı" : "total tabanlı — ttft yok")}]");
+    Console.WriteLine($"   a_ttft   : {aTtft:F4}  (R²={aTtftR2:F3}, n={aTtftX.Length})");
+    Console.WriteLine($"   a_total  : {aTotal:F4}  (R²={aTotalR2:F3}, n={aX.Length})  <- eski yöntem");
+    Console.WriteLine($"Decode  (b) : {b:F3} ms / output token   (~{(b > 0 ? 1000 / b : 0):F1} tok/s, R²={bR2:F3})");
     Console.WriteLine($"Sabit   (c) : {pureOverhead:F0} ms   (B kolu kesişimi: {bIntercept:F0} ms)");
     Console.WriteLine();
-    Console.WriteLine($">>> 1 output token ≈ {ratio:F0} input token maliyeti <<<");
+
+    // Sessiz saçmalama koruması. Eskiden a<=0 iken CSV'ye "oran = 0" yazılıyordu
+    // ve bu, ölçülmüş bir sonuç gibi okunuyordu.
+    var suspect = new List<string>();
+    if (a <= 1e-9) suspect.Add($"prefill katsayısı pozitif değil (a={a:F5})");
+    if (b <= 1e-9) suspect.Add($"decode katsayısı pozitif değil (b={b:F5})");
+    if (pureOverhead < 0) suspect.Add($"sabit overhead negatif ({pureOverhead:F0} ms) — b farklı bir rejimden ödünç alınıyor");
+    if (aTtftR2 < 0.9 && aTtftX.Length >= 2) suspect.Add($"prefill uyumu zayıf (R²={aTtftR2:F3})");
+    if (bR2 < 0.9) suspect.Add($"decode uyumu zayıf (R²={bR2:F3})");
+    if (Math.Abs(aTotal - aTtft) > 0.5 * Math.Max(aTtft, 1e-9) && aFromTtft)
+        suspect.Add("a_total ile a_ttft %50'den fazla ayrışıyor — A kolunda çıktı uzunluğu sabit değil");
+
+    if (double.IsNaN(ratio))
+        Console.WriteLine(">>> out/in maliyet oranı HESAPLANAMADI (a <= 0) <<<");
+    else
+        Console.WriteLine($">>> 1 output token ≈ {ratio:F0} input token maliyeti <<<");
+
+    if (suspect.Count > 0)
+    {
+        Console.WriteLine();
+        Console.WriteLine("UYARI — katsayılar şüpheli, olduğu gibi rapora taşıma:");
+        foreach (var s in suspect) Console.WriteLine($"  - {s}");
+    }
+
     Console.WriteLine();
     Console.WriteLine("Sonuç: prompt uzunluğu ucuz, cevap uzunluğu pahalı.");
     Console.WriteLine("RAG'de top-k'yı cömert tut; 'kısa cevap ver' bir performans kararıdır.");
 
     Csv.Write(config, "02_prefill_decode",
         ["run_id", "model", "kol", "input_tokens", "output_tokens",
-         "ttft_any_p50_ms", "total_p50_ms", "total_p95_ms"],
+         "ttft_any_p50_ms", "total_p50_ms", "total_p95_ms",
+         "temperature", "n_ornek", "n_ttft_olculen",
+         "out_tok_min", "out_tok_max", "tahmini_out_token_sayisi", "max_tokens_kesilen"],
         rows);
 
     Csv.Write(config, "02_katsayilar",
-        ["run_id", "model", "prefill_ms_per_in_token", "decode_ms_per_out_token",
-         "tok_per_sec", "sabit_overhead_ms", "out_in_maliyet_orani"],
-        [[runId, client.ModelId, Inv(a, "F5"), Inv(b, "F4"),
-          Inv(b > 0 ? 1000 / b : 0, "F2"), Inv(pureOverhead, "F1"), Inv(ratio, "F1")]]);
+        ["run_id", "model", "prefill_ms_per_in_token", "prefill_kaynak",
+         "prefill_ttft_ms_per_in_token", "prefill_ttft_r2",
+         "prefill_total_ms_per_in_token", "prefill_total_r2",
+         "decode_ms_per_out_token", "decode_r2", "tok_per_sec",
+         "sabit_overhead_ms", "b_kolu_kesisim_ms", "out_in_maliyet_orani",
+         "n_ornek_per_nokta", "a_kolu_temperature", "b_kolu_temperature", "uyarilar"],
+        [[runId, client.ModelId,
+          Inv(a, "F5"), aFromTtft ? "ttft" : "total",
+          Inv(aTtft, "F5"), Inv(aTtftR2, "F4"),
+          Inv(aTotal, "F5"), Inv(aTotalR2, "F4"),
+          Inv(b, "F4"), Inv(bR2, "F4"), Inv(b > 0 ? 1000 / b : 0, "F2"),
+          Inv(pureOverhead, "F1"), Inv(bIntercept, "F1"),
+          double.IsNaN(ratio) ? "" : Inv(ratio, "F1"),
+          reps.ToString(), Inv(aTemp, "F2"), Inv(bTemp, "F2"),
+          string.Join("; ", suspect)]]);
 }
 
 
@@ -405,48 +659,92 @@ static async Task Experiment3_Determinism(LmClient client, Config config, string
     };
 
     var rows = new List<string[]>();
-    Console.WriteLine($"{"kol",-20} {"benzersiz",12} {"ilk_ile_ayni",14} {"ort_kar",10} {"bos",6}");
-    Console.WriteLine(new string('-', 66));
+    Console.WriteLine($"{"kol",-20} {"benzersiz",12} {"bos_haric",11} {"ilk_ile_ayni",13} {"ort_kar",9} {"bos",5}");
+    Console.WriteLine(new string('-', 74));
 
     foreach (var (name, temp, seed) in arms)
     {
-        var outputs = new List<string>();
+        var results = new List<ChatResult>();
         for (var i = 0; i < n; i++)
         {
-            var r = await client.ChatAsync([new Message("user", prompt)],
-    2500, temp, seed: seed, disableThinking: true);
-            outputs.Add(r.Text.Trim());
+            results.Add(await client.ChatAsync([new Message("user", prompt)],
+                2500, temp, seed: seed, disableThinking: true));
         }
+
+        var outputs = results.Select(r => r.Text.Trim()).ToList();
+        var nonEmpty = outputs.Where(o => o.Length > 0).ToList();
 
         var emptyCount = outputs.Count(string.IsNullOrEmpty);
         var distinct = outputs.Distinct().Count();
+
+        // Boş çıktılar da "benzersiz" sayılıyordu: temp=1.8 kolundaki 20/20'nin
+        // bir birimi tek bir boş string'di. Boş hariç sayımı ayrı raporluyoruz.
+        var distinctNonEmpty = nonEmpty.Distinct().Count();
         var samePct = 100.0 * outputs.Count(o => o == outputs[0]) / n;
         var avgLen = outputs.Average(o => o.Length);
+        var avgLenNonEmpty = nonEmpty.Count > 0 ? nonEmpty.Average(o => o.Length) : 0;
 
-        Console.WriteLine($"{name,-20} {distinct + "/" + n,12} {samePct,13:F0}% {avgLen,10:F0} {emptyCount,6}");
+        // v1'in hatası reasoning'i hiç okumamaktı; Deney 3 hâlâ yalnızca Text'i
+        // saklayıp reasoning'i, token sayılarını ve süreyi atıyordu — yani boş
+        // çıktının sebebi (bütçe reasoning'e mi gitti?) veriden görülemiyordu.
+        var avgReasoningChars = results.Average(r => (double)r.Reasoning.Length);
+        var avgCompletionTok = results.Average(r => (double)r.CompletionTokens);
+        var avgReasoningTok = results.Average(r => (double)r.ReasoningTokens);
+        var truncated = results.Count(r => r.FinishReason == "length");
+
+        Console.WriteLine($"{name,-20} {distinct + "/" + n,12} {distinctNonEmpty + "/" + nonEmpty.Count,11} " +
+                          $"{samePct,12:F0}% {avgLen,9:F0} {emptyCount,5}");
 
         if (emptyCount > 0)
-            Console.WriteLine($"  UYARI: {emptyCount}/{n} çıktı BOŞ — reasoning kanalını kontrol et.");
+            Console.WriteLine($"  UYARI: {emptyCount}/{n} çıktı BOŞ " +
+                              $"(ort. reasoning {avgReasoningChars:F0} kar / {avgReasoningTok:F0} token — " +
+                              "bütçe düşünmeye gitmiş olabilir).");
+
+        if (truncated > 0)
+            Console.WriteLine($"  UYARI: {truncated}/{n} çıktı max_tokens tavanında kesildi — " +
+                              "çeşitlilik sayımı kesik metinleri karşılaştırıyor.");
 
         rows.Add([runId, client.ModelId, name,
                   Inv(temp, "F1"), seed?.ToString() ?? "",
                   n.ToString(), distinct.ToString(),
-                  Inv(samePct, "F1"), Inv(avgLen, "F0"), emptyCount.ToString()]);
+                  Inv(samePct, "F1"), Inv(avgLen, "F0"), emptyCount.ToString(),
+                  distinctNonEmpty.ToString(), Inv(avgLenNonEmpty, "F0"),
+                  Inv(avgReasoningChars, "F0"), Inv(avgCompletionTok, "F0"),
+                  Inv(avgReasoningTok, "F0"), truncated.ToString()]);
 
-        File.WriteAllText(
-            Path.Combine(config.OutputDir, $"03_ornek_{name}.txt"),
-            string.Join("\n\n----- yeni çıktı -----\n\n", outputs.Take(3)),
-            Encoding.UTF8);
+        // 20 çıktının 17'si diske hiç ulaşmıyordu; Levenshtein/self-BLEU gibi
+        // dereceli çeşitlilik metrikleri sonradan hesaplanamıyordu. Hepsini yaz.
+        var dump = new StringBuilder();
+        dump.AppendLine($"# {name} — temp={temp}, seed={(seed?.ToString() ?? "yok")}, n={n} — {runId}");
+        for (var i = 0; i < results.Count; i++)
+        {
+            dump.AppendLine();
+            dump.AppendLine($"----- çıktı {i + 1}/{n} " +
+                            $"(content {outputs[i].Length} kar, reasoning {results[i].Reasoning.Length} kar, " +
+                            $"finish={results[i].FinishReason}) -----");
+            dump.AppendLine();
+            dump.AppendLine(outputs[i].Length == 0 ? "(boş)" : outputs[i]);
+        }
+
+        WriteTextOutput(config, $"03_ornek_{name}.txt", dump.ToString(), runId);
     }
 
-    Console.WriteLine(new string('-', 66));
+    Console.WriteLine(new string('-', 74));
     Console.WriteLine("Beklenti: temp=0 -> 1/20 benzersiz (deterministik).");
     Console.WriteLine("          temp=1.8 -> yüksek çeşitlilik. DEĞİLSE temperature modele");
     Console.WriteLine("          ulaşmıyor (LM Studio 'Default Parameters' eziyor olabilir).");
+    Console.WriteLine();
+    Console.WriteLine("SINIR: çağrılar sıralı — aynı anda tek istek uçuyor. Sunucu tarafı");
+    Console.WriteLine("       batching kaynaklı non-determinizm bu tasarımla ÖLÇÜLEMEZ.");
+    Console.WriteLine("SINIR: 'benzersiz' tam string eşitliği; n'de doyar. temp=0.8 ile 1.8'i");
+    Console.WriteLine("       ayırt edemez, bu yüzden kontrol kolu zayıf bir sinyaldir.");
 
     Csv.Write(config, "03_determinizm",
         ["run_id", "model", "kol", "temperature", "seed", "n",
-         "benzersiz_cikti", "ilk_ile_ayni_yuzde", "ort_karakter", "bos_cikti_sayisi"],
+         "benzersiz_cikti", "ilk_ile_ayni_yuzde", "ort_karakter", "bos_cikti_sayisi",
+         "benzersiz_bos_haric", "ort_karakter_bos_haric",
+         "ort_reasoning_karakter", "ort_completion_token", "ort_reasoning_token",
+         "max_tokens_kesilen"],
         rows);
 }
 
@@ -489,16 +787,18 @@ static async Task Experiment4_KvCache(LmClient client, Config config, string run
 
     var rows = new List<string[]>();
     var systemBase = "Aşağıdaki sözleşme dokümanına göre cevap ver.\n\n" + document;
+    var emptyAssistantTurns = 0;
 
     foreach (var cacheFriendly in new[] { true, false })
     {
         var mode = cacheFriendly ? "cache_dostu" : "cache_dusmani";
         Console.WriteLine($"\n{mode}:");
-        Console.WriteLine($"{"tur",4} {"prompt_tok",12} {"kumulatif",12} {"ttftAny",10} {"total",10}");
-        Console.WriteLine(new string('-', 52));
+        Console.WriteLine($"{"tur",4} {"prompt_tok",12} {"kumulatif",12} {"cevap_kar",10} {"ttftAny",10} {"total",10}");
+        Console.WriteLine(new string('-', 62));
 
         var history = new List<Message> { new("system", systemBase) };
-        var cumulative = 0;
+        var cumulativePrompt = 0;
+        var cumulativeTotal = 0;
 
         for (var t = 0; t < turns.Length; t++)
         {
@@ -512,35 +812,86 @@ static async Task Experiment4_KvCache(LmClient client, Config config, string run
             history.Add(new Message("user", turns[t]));
 
             var r = await client.ChatStreamAsync(history, 150, 0, disableThinking: true);
-            history.Add(new Message("assistant", string.IsNullOrEmpty(r.Text) ? "(bos)" : r.Text));
 
-            cumulative += r.PromptTokens;
+            // Model yalnızca reasoning ürettiyse content boş gelir. Geçmişe
+            // reasoning YAZMIYORUZ (model kendi düşüncesini geri okumaz), ama
+            // "(bos)" yazıp sessizce geçmek de yanlıştı: CSV, 150 token'lık bir
+            // cevap eklenmiş gibi okunuyordu. Gerçeği ayrı bir kolona yazıyoruz.
+            var answer = r.Text.Trim();
+            if (answer.Length == 0) emptyAssistantTurns++;
+            history.Add(new Message("assistant", answer.Length == 0 ? "(cevap yok)" : answer));
 
-            Console.WriteLine($"{t + 1,4} {r.PromptTokens,12} {cumulative,12} {r.TtftAnyMs,10:F1} {r.TotalMs,10:F1}");
+            cumulativePrompt += r.PromptTokens;
+            cumulativeTotal += r.PromptTokens + r.CompletionTokens;
+
+            Console.WriteLine($"{t + 1,4} {r.PromptTokens,12} {cumulativePrompt,12} {answer.Length,10} " +
+                              $"{Fmt(r.TtftAnyMs),10} {r.TotalMs,10:F1}");
 
             rows.Add([runId, client.ModelId, mode, (t + 1).ToString(),
-                      r.PromptTokens.ToString(), cumulative.ToString(),
+                      r.PromptTokens.ToString(), cumulativePrompt.ToString(),
                       r.CompletionTokens.ToString(),
-                      Inv(r.TtftAnyMs, "F2"), Inv(r.TotalMs, "F2")]);
+                      Inv(r.TtftAnyMs, "F2"), Inv(r.TotalMs, "F2"),
+                      cumulativeTotal.ToString(), answer.Length.ToString(),
+                      r.Reasoning.Length.ToString(), r.FinishReason]);
         }
     }
 
     // Tur 1 hariç: ilk turda iki kol da soğuk, karşılaştırma anlamsız.
-    var dostu = rows.Where(r => r[2] == "cache_dostu").Skip(1)
-                    .Average(r => double.Parse(r[7], CultureInfo.InvariantCulture));
-    var dusman = rows.Where(r => r[2] == "cache_dusmani").Skip(1)
-                     .Average(r => double.Parse(r[7], CultureInfo.InvariantCulture));
+    // Filtre pozisyonel Skip(1) değil, tur kolonu üzerinden: döngü sırası
+    // değişirse Skip(1) sessizce yanlış satırı atardı.
+    // Ölçülemeyen ttft (-1) ortalamaya girmiyor.
+    static double[] Ttfts(List<string[]> src, string mode) => src
+        .Where(r => r[2] == mode && r[3] != "1")
+        .Select(r => double.Parse(r[7], CultureInfo.InvariantCulture))
+        .Where(v => v >= 0)
+        .ToArray();
 
-    Console.WriteLine(new string('-', 52));
-    Console.WriteLine($"Ortalama ttftAny (tur 2-5): cache_dostu {dostu:F0} ms | cache_dusmani {dusman:F0} ms");
-    Console.WriteLine($"Cache kazancı: {dusman - dostu:F0} ms  (%{100 * (dusman - dostu) / Math.Max(dusman, 1):F0})");
-    Console.WriteLine();
-    Console.WriteLine("prompt_tokens iki kolda da benzer artar (protokol gerçeği değişmez),");
-    Console.WriteLine("ama ttft cache_dostu kolda düşük kalır (sunucu optimizasyonu).");
+    var dostuVals = Ttfts(rows, "cache_dostu");
+    var dusmanVals = Ttfts(rows, "cache_dusmani");
+
+    if (dostuVals.Length == 0 || dusmanVals.Length == 0)
+    {
+        Console.WriteLine(new string('-', 62));
+        Console.WriteLine("UYARI: karşılaştırma için yeterli ttft ölçümü yok, özet atlanıyor.");
+    }
+    else
+    {
+        // Medyan — modülün kendi kuralı bu (bkz. Stats bloğu). Burada Average
+        // kullanılıyordu ve tek bir termal spike manşet sayıyı bozabiliyordu.
+        var dostu = Stats.Median(dostuVals);
+        var dusman = Stats.Median(dusmanVals);
+
+        // Ham fark yanıltıcı olabilir: cache_dusmani kolunun prompt'u GUID
+        // yüzünden birkaç token daha uzun. Token başına normalize edip de veriyoruz.
+        var dostuTok = rows.Where(r => r[2] == "cache_dostu" && r[3] != "1")
+                           .Average(r => double.Parse(r[4], CultureInfo.InvariantCulture));
+        var dusmanTok = rows.Where(r => r[2] == "cache_dusmani" && r[3] != "1")
+                            .Average(r => double.Parse(r[4], CultureInfo.InvariantCulture));
+
+        Console.WriteLine(new string('-', 62));
+        Console.WriteLine($"Medyan ttftAny (tur 2-5): cache_dostu {dostu:F0} ms | cache_dusmani {dusman:F0} ms");
+        Console.WriteLine($"Cache kazancı: {dusman - dostu:F0} ms  (%{100 * (dusman - dostu) / Math.Max(dusman, 1):F0})");
+        Console.WriteLine($"Prompt boyutu (tur 2-5 ort.): dostu {dostuTok:F0} tok | dusmani {dusmanTok:F0} tok");
+        Console.WriteLine($"Token başına prefill: dostu {dostu / Math.Max(dostuTok, 1):F4} ms | " +
+                          $"dusmani {dusman / Math.Max(dusmanTok, 1):F4} ms/token");
+        Console.WriteLine();
+        Console.WriteLine("prompt_tokens iki kolda da benzer artar (protokol gerçeği değişmez),");
+        Console.WriteLine("ama ttft cache_dostu kolda düşük kalır (sunucu optimizasyonu).");
+    }
+
+    if (emptyAssistantTurns > 0)
+    {
+        Console.WriteLine();
+        Console.WriteLine($"UYARI: {emptyAssistantTurns} turda asistan cevabı BOŞ geldi ve geçmişe");
+        Console.WriteLine("       '(cevap yok)' olarak eklendi. Yani bu bir 5 turluk GERÇEK konuşma");
+        Console.WriteLine("       değil; completion_tokens kolonu cevabın geçmişe girdiğini göstermez.");
+        Console.WriteLine("       KV cache karşılaştırması geçerli, konuşma anlatısı değil.");
+    }
 
     Csv.Write(config, "04_kv_cache",
-        ["run_id", "model", "mod", "tur", "prompt_tokens", "kumulatif_tokens",
-         "completion_tokens", "ttft_any_ms", "total_ms"],
+        ["run_id", "model", "mod", "tur", "prompt_tokens", "kumulatif_prompt_tokens",
+         "completion_tokens", "ttft_any_ms", "total_ms",
+         "kumulatif_toplam_tokens", "asistan_cevap_karakter", "reasoning_karakter", "finish_reason"],
         rows);
 }
 
@@ -566,11 +917,13 @@ static async Task Experiment5_Concurrency(LmClient client, Config config, string
     var levels = new[] { 1, 2, 4, 8, 16, 32 };
     var rows = new List<string[]>();
 
-    Console.WriteLine($"{"paralel",8} {"toplam tok/s",14} {"p50 lat",10} {"p95 lat",10} {"istek/s",10} {"hata",6}");
-    Console.WriteLine(new string('-', 62));
+    Console.WriteLine($"{"paralel",8} {"basarili",9} {"toplam tok/s",14} {"p50 lat",10} {"p95 lat",10} {"istek/s",10} {"hata",6}");
+    Console.WriteLine(new string('-', 72));
 
     foreach (var level in levels)
     {
+        var errors = new List<string>();
+        var errorLock = new object();
         var sw = Stopwatch.StartNew();
 
         var tasks = Enumerable.Range(0, level).Select(async _ =>
@@ -586,7 +939,11 @@ static async Task Experiment5_Concurrency(LmClient client, Config config, string
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"  hata: {Trunc(ex.Message, 120)}");
+                // Hata TÜRÜ kalıcı veriye geçsin: 429 / timeout / bağlantı kopması
+                // / 500 ayrımı yapılamadığında sınırın istemcide mi sunucuda mı
+                // olduğu sonradan hiç bilinemiyordu.
+                lock (errorLock) errors.Add(ex.GetType().Name);
+                Console.WriteLine($"  hata ({ex.GetType().Name}): {Trunc(ex.Message, 120)}");
                 return null;
             }
         }).ToArray();
@@ -596,39 +953,62 @@ static async Task Experiment5_Concurrency(LmClient client, Config config, string
 
         var ok = all.Where(r => r is not null).Select(r => r!).ToArray();
         var failed = all.Length - ok.Length;
+        var wallSec = sw.Elapsed.TotalSeconds;
+        var errorKinds = string.Join("|", errors.GroupBy(e => e).Select(g => $"{g.Key}x{g.Count()}"));
 
         if (ok.Length == 0)
         {
-            Console.WriteLine($"{level,8} {"-",14} {"-",10} {"-",10} {"-",10} {failed,6}");
+            // Satır YAZILIYOR. Eskiden continue ediliyordu ve CSV'de "tamamen
+            // çöktü" ile "hiç denenmedi" ayırt edilemiyordu.
+            Console.WriteLine($"{level,8} {0,9} {"-",14} {"-",10} {"-",10} {"-",10} {failed,6}");
+
+            rows.Add([runId, client.ModelId, level.ToString(), "0",
+                      Inv(wallSec, "F3"), "", "", "", "", failed.ToString(),
+                      "0", errorKinds, "1"]);
+
             await Task.Delay(3000);
             continue;
         }
 
-        var wallSec = sw.Elapsed.TotalSeconds;
         var totalOut = ok.Sum(r => r.CompletionTokens);
         var aggTps = totalOut / wallSec;
         var p50 = Stats.Median(ok.Select(r => r.TotalMs));
         var p95 = Stats.Percentile(ok.Select(r => r.TotalMs), 95);
         var rps = ok.Length / wallSec;
 
-        Console.WriteLine($"{level,8} {aggTps,14:F1} {p50,10:F0} {p95,10:F0} {rps,10:F2} {failed,6}");
+        Console.WriteLine($"{level,8} {ok.Length,9} {aggTps,14:F1} {p50,10:F0} {p95,10:F0} {rps,10:F2} {failed,6}");
+
+        if (failed > 0)
+            Console.WriteLine($"  UYARI: duvar saati TÜM istekleri (başarısızlar dahil) kapsıyor, " +
+                              $"throughput {failed} hata yüzünden düşük görünüyor.");
 
         rows.Add([runId, client.ModelId, level.ToString(), totalOut.ToString(),
                   Inv(wallSec, "F3"), Inv(aggTps, "F2"),
-                  Inv(p50, "F1"), Inv(p95, "F1"), Inv(rps, "F3"), failed.ToString()]);
+                  Inv(p50, "F1"), Inv(p95, "F1"), Inv(rps, "F3"), failed.ToString(),
+                  ok.Length.ToString(), errorKinds, failed > 0 ? "1" : "0"]);
 
         // GPU'nun toparlanması için ara — termal ve bellek baskısı bir sonraki
         // seviyeye sızmasın. Ölçüm ortamının kendisi de veridir.
         await Task.Delay(3000);
     }
 
-    Console.WriteLine(new string('-', 62));
+    Console.WriteLine(new string('-', 72));
     Console.WriteLine("Doyum noktası: toplam tok/s'in artmayı bıraktığı paralellik seviyesi.");
     Console.WriteLine("Kapasite kararı bu noktadan ÖNCESİ, p95 latency bütçene göre alınır.");
+    Console.WriteLine();
+    Console.WriteLine("SINIR: p95 burada nearest-rank ile hesaplanıyor ve n <= 20 iken");
+    Console.WriteLine("       matematiksel olarak MAKSİMUM'a eşittir (n = başarılı istek sayısı).");
+    Console.WriteLine("       Yani p50/p95 kuyruk istatistiği değil, tek batch'in en yavaş isteği.");
+    Console.WriteLine("SINIR: seviyeler tek koşu ve daima artan sırada — en yüksek paralellik");
+    Console.WriteLine("       daima en ısınmış GPU'da ölçülüyor. Tekrar/karşı-dengeleme yok.");
+    Console.WriteLine("ÖNCE DOĞRULA: sunucunun Max Concurrent Predictions ayarı test edilen en");
+    Console.WriteLine("       yüksek seviyeden BÜYÜK olmalı; değilse ölçtüğün şey GPU doyumu");
+    Console.WriteLine("       değil, config kuyruğudur ve 'doyum noktası' dairesel bir sonuç olur.");
 
     Csv.Write(config, "05_esyamanlilik",
         ["run_id", "model", "paralellik", "toplam_output_token", "duvar_saati_sn",
-         "toplam_tok_per_sn", "p50_latency_ms", "p95_latency_ms", "istek_per_sn", "hata_sayisi"],
+         "toplam_tok_per_sn", "p50_latency_ms", "p95_latency_ms", "istek_per_sn", "hata_sayisi",
+         "basarili_istek", "hata_turleri", "guvenilmez"],
         rows);
 }
 
@@ -675,6 +1055,21 @@ static async Task Experiment6_QualitySpotCheck(LmClient client, Config config, s
     sb.AppendLine("maliyeti hak edip etmediği ölçülebilir bir sorudur.");
     sb.AppendLine();
 
+    // Düşünme gerçekten kapanmıyorsa iki kol AYNI isteği gönderir ve deney
+    // hiçbir şey ölçmez. Bunu baştan söyleyip çıktıya damgalıyoruz — eski
+    // koşularda iki kolun token sayıları birebir aynı çıkıyordu ve fark
+    // yalnızca dosyayı elle okuyunca görülüyordu.
+    if (!client.CanDisableThinking)
+    {
+        Console.WriteLine("UYARI: düşünme kapatılamıyor (ön kontrol). Tek kol koşulacak;");
+        Console.WriteLine("       'acik' / 'kapali' karşılaştırması bu koşuda yapılmayacak.");
+        sb.AppendLine("> **UYARI:** Ön kontrolde düşünme kapatılamadı. Aşağıdaki çıktılar tek");
+        sb.AppendLine("> kola aittir; açık/kapalı kalite-maliyet karşılaştırması YAPILMAMIŞTIR.");
+        sb.AppendLine("> isteği gönderiyor; token sayılarının birebir aynı çıkması beklenen");
+        sb.AppendLine("> sonuçtur ve bir kalite/maliyet karşılaştırması DEĞİLDİR.");
+        sb.AppendLine();
+    }
+
     var rows = new List<string[]>();
 
     for (var i = 0; i < prompts.Length; i++)
@@ -685,42 +1080,105 @@ static async Task Experiment6_QualitySpotCheck(LmClient client, Config config, s
         sb.AppendLine($"**Prompt:** {prompts[i]}");
         sb.AppendLine();
 
-        foreach (var think in new[] { true, false })
+        var arms = client.CanDisableThinking ? new[] { true, false } : new[] { true };
+
+        foreach (var think in arms)
         {
             var label = think ? "düşünme AÇIK" : "düşünme KAPALI";
             var r = await client.ChatAsync([new Message("user", prompts[i])],
                 3000, 0, seed: 42, disableThinking: !think);
 
+            // max_tokens reasoning + content TOPLAMINI kapsıyor. Bütçe düşünmeye
+            // gidip content'e hiç sıra gelmediğinde bu bir "hata" değil, bir
+            // BÜTÇE olayıdır; ikisini aynı etikete koymak yanlış teşhis üretiyordu.
+            var truncated = r.FinishReason == "length";
+            var body = r.Text.Trim();
+
             sb.AppendLine($"### {label}");
             sb.AppendLine();
-            sb.AppendLine(string.IsNullOrWhiteSpace(r.Text) ? "_(boş çıktı — hata)_" : r.Text.Trim());
+
+            if (body.Length > 0)
+            {
+                sb.AppendLine(body);
+                if (truncated)
+                    sb.AppendLine("\n_(max_tokens tavanında kesildi — cevap eksik)_");
+            }
+            else if (truncated)
+            {
+                sb.AppendLine($"_(görünür cevap YOK — {r.ReasoningTokens} token'lık bütçenin tamamı " +
+                              "düşünmeye gitti ve max_tokens tavanına dayandı; bu bir hata değil, " +
+                              "bütçe olayıdır)_");
+            }
+            else
+            {
+                sb.AppendLine("_(boş çıktı — hata)_");
+            }
+
             sb.AppendLine();
             sb.AppendLine($"*{r.PromptTokens} in / {r.CompletionTokens} out " +
-                          $"(reasoning: {r.ReasoningTokens}) — {r.TotalMs:F0} ms*");
+                          $"(reasoning: {r.ReasoningTokens}) — {r.TotalMs:F0} ms — finish: {r.FinishReason}*");
             sb.AppendLine();
+
+            // Reasoning metni hiç diske yazılmıyordu; "1016 token düşünüp yanlış
+            // cevap verdi" gibi bir iddia çıktı dosyalarından doğrulanamıyordu.
+            if (r.Reasoning.Length > 0)
+            {
+                sb.AppendLine("<details><summary>reasoning (" + r.Reasoning.Length + " karakter)</summary>");
+                sb.AppendLine();
+                sb.AppendLine("```");
+                sb.AppendLine(r.Reasoning.Trim());
+                sb.AppendLine("```");
+                sb.AppendLine();
+                sb.AppendLine("</details>");
+                sb.AppendLine();
+            }
+
             sb.AppendLine("**Değerlendirme:** _(D/K/Y/H — elle doldur)_");
             sb.AppendLine();
 
             rows.Add([runId, client.ModelId, (i + 1).ToString(), think ? "acik" : "kapali",
                       r.PromptTokens.ToString(), r.CompletionTokens.ToString(),
                       r.ReasoningTokens.ToString(), Inv(r.TotalMs, "F0"),
-                      r.Text.Length.ToString(), ""]);
+                      r.Text.Length.ToString(), "",
+                      r.Reasoning.Length.ToString(), r.FinishReason,
+                      truncated ? "1" : "0",
+                      client.CanDisableThinking ? "1" : "0"]);
         }
 
         sb.AppendLine("---");
         sb.AppendLine();
     }
 
-    var path = Path.Combine(config.OutputDir, "06_kalite_spot_kontrolu.md");
-    File.WriteAllText(path, sb.ToString(), Encoding.UTF8);
+    // Elle doldurulan değerlendirmeleri EZMİYORUZ. Eskiden aynı ada
+    // File.WriteAllText yapılıyordu ve ikinci koşu saatlerce süren insan
+    // emeğini uyarısız siliyordu.
+    var path = WriteTextOutput(config, "06_kalite_spot_kontrolu.md", sb.ToString(), runId);
 
     Csv.Write(config, "06_kalite_metrik",
         ["run_id", "model", "soru_no", "dusunme", "prompt_tokens", "completion_tokens",
-         "reasoning_tokens", "total_ms", "cevap_karakter", "degerlendirme"],
+         "reasoning_tokens", "total_ms", "cevap_karakter", "degerlendirme",
+         "reasoning_karakter", "finish_reason", "max_tokens_kesilen", "dusunme_kapatilabildi"],
         rows);
 
     Console.WriteLine($"\nÇıktı: {path}");
     Console.WriteLine("Bu dosyayı elle doldur. Faz 3 eval veri setinin tohumu olacak.");
+
+    if (client.CanDisableThinking)
+    {
+        var identical = rows.Where((_, idx) => idx % 2 == 0)
+                            .Zip(rows.Where((_, idx) => idx % 2 == 1),
+                                 (on, off) => on[5] == off[5] && on[6] == off[6] && on[8] == off[8])
+                            .Count(same => same);
+
+        if (identical > 0)
+            Console.WriteLine($"UYARI: {identical}/{prompts.Length} soruda iki kol birebir aynı " +
+                              "sonucu verdi — düşünme kapandığı sanılıyor ama kapanmıyor.");
+    }
+    else
+    {
+        Console.WriteLine("NOT: düşünme kapatılamadığı için tek kol koşuldu; " +
+                          "açık/kapalı karşılaştırması bu koşuda YAPILMADI.");
+    }
 }
 
 
@@ -740,7 +1198,30 @@ static string Inv(double v, string fmt) => v.ToString(fmt, CultureInfo.Invariant
 
 static string Fmt(double ttft) => ttft < 0 ? "yok" : $"{ttft:F0}ms";
 
-static string Trunc(string s, int max) => s.Length <= max ? s : s[..max] + "...";
+static string Trunc(string s, int max) => Text.Trunc(s, max);
+
+/// <summary>
+/// Metin çıktısını yazar ama VAR OLANI EZMEZ. Deney 3'ün örnekleri ve Deney 6'nın
+/// Markdown'ı elle doldurulan alanlar içeriyor; sabit ada File.WriteAllText yapmak
+/// ikinci koşuda insan emeğini uyarısız siliyordu. Dosya varsa run_id'li bir
+/// kardeş dosyaya yazıp yolu döndürüyoruz.
+/// </summary>
+static string WriteTextOutput(Config config, string fileName, string content, string runId)
+{
+    var path = Path.Combine(config.OutputDir, fileName);
+
+    if (File.Exists(path))
+    {
+        var stem = Path.GetFileNameWithoutExtension(fileName);
+        var ext = Path.GetExtension(fileName);
+        path = Path.Combine(config.OutputDir, $"{stem}.{runId}{ext}");
+        Console.WriteLine($"   NOT: {fileName} zaten var (elle doldurulmuş olabilir), " +
+                          $"yeni çıktı {Path.GetFileName(path)} olarak yazıldı.");
+    }
+
+    File.WriteAllText(path, content, Encoding.UTF8);
+    return path;
+}
 
 // Belirli uzunlukta doldurma metni. Türkçe kullanıyoruz ki prefill ölçümü
 // gerçek kullanım senaryosunu yansıtsın (Deney 1'deki token cezası dahil).
@@ -777,6 +1258,12 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
     /// Ön kontrol sonucuna göre çalışma zamanında set edilir.
     /// </summary>
     public bool UseNoThinkFallback { get; set; }
+
+    /// <summary>
+    /// Ön kontrolde düşünmenin gerçekten kapatılabildiği doğrulandı mı?
+    /// Deney 6 buna bakıp "iki kol aynı isteği gönderiyor" uyarısını basıyor.
+    /// </summary>
+    public bool CanDisableThinking { get; set; }
 
     static readonly JsonSerializerOptions JsonOpts = new()
     {
@@ -820,28 +1307,43 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
         sw.Stop();
 
         if (!res.IsSuccessStatusCode)
-            throw new InvalidOperationException($"{(int)res.StatusCode} — {TruncStatic(raw, 400)}");
+            throw new InvalidOperationException($"{(int)res.StatusCode} — {Text.Trunc(raw, 400)}");
 
         using var doc = JsonDocument.Parse(raw);
         var root = doc.RootElement;
 
+        // Bazı OpenAI-uyumlu sunucular hatayı 200 ile { "error": ... } gövdesinde
+        // döndürüyor. Stream yolunda bu kontrol vardı, burada yoktu: sonuç boş bir
+        // ChatResult olarak sessizce geçip Deney 1'de "oran 0.000" gibi masum
+        // görünen ama yanlış sayılara dönüşüyordu.
+        if (root.TryGetProperty("error", out var errEl))
+            throw new InvalidOperationException($"sunucu hatası (HTTP 200) — {Text.Trunc(errEl.ToString(), 400)}");
+
         var text = "";
         var reasoning = "";
+        var finishReason = "";
 
-        if (root.TryGetProperty("choices", out var choices) && choices.GetArrayLength() > 0
-            && choices[0].TryGetProperty("message", out var msg))
+        if (root.TryGetProperty("choices", out var choices) && choices.GetArrayLength() > 0)
         {
-            // Reasoning modelleri burada da ayrı alan kullanıyor.
-            // v1 sadece content'e bakıyordu ve boş string alıyordu.
-            text = ReadStringProp(msg, "content") ?? "";
-            reasoning = ReadStringProp(msg, "reasoning_content")
-                     ?? ReadStringProp(msg, "reasoning")
-                     ?? "";
+            if (choices[0].TryGetProperty("message", out var msg))
+            {
+                // Reasoning modelleri burada da ayrı alan kullanıyor.
+                // v1 sadece content'e bakıyordu ve boş string alıyordu.
+                text = ReadStringProp(msg, "content") ?? "";
+                reasoning = ReadStringProp(msg, "reasoning_content")
+                         ?? ReadStringProp(msg, "reasoning")
+                         ?? "";
+            }
+
+            // finish_reason hiç okunmuyordu: max_tokens tavanında kesilmiş bir
+            // cevap ile normal biten cevap ayırt edilemiyor, budanma "hata" diye
+            // etiketleniyordu.
+            finishReason = ReadStringProp(choices[0], "finish_reason") ?? "";
         }
 
         var (pt, ct, rt) = ReadUsage(root);
 
-        return new ChatResult(text, reasoning, pt, ct, rt, sw.Elapsed.TotalMilliseconds);
+        return new ChatResult(text, reasoning, pt, ct, rt, sw.Elapsed.TotalMilliseconds, finishReason);
     }
 
     // ------------------------------------------------------------------------
@@ -885,18 +1387,28 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
         using var res = await http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead);
         if (!res.IsSuccessStatusCode)
             throw new InvalidOperationException(
-                $"{(int)res.StatusCode} — {TruncStatic(await res.Content.ReadAsStringAsync(), 400)}");
+                $"{(int)res.StatusCode} — {Text.Trunc(await res.Content.ReadAsStringAsync(), 400)}");
 
         using var stream = await res.Content.ReadAsStreamAsync();
         using var reader = new StreamReader(stream);
 
+        var finishReason = "";
+        var dataLines = 0;
+
         while (await reader.ReadLineAsync() is { } line)
         {
             if (line.Length == 0) continue;                  // SSE ayırıcı
-            if (!line.StartsWith("data: ")) continue;
+            if (!line.StartsWith("data:")) continue;         // ':' sonrası boşluk SSE'de OPSİYONEL
 
-            var payload = line[6..];
-            if (payload == "[DONE]") break;
+            // Eskiden "data: " (boşluklu) sabit prefix'i aranıyor ve line[6..]
+            // ile kesiliyordu; "data:{...}" yayan bir sunucuda TÜM chunk'lar
+            // sessizce düşüyor, ttft ölçülemiyor ve v1'in ttft==total hatası
+            // hiçbir uyarı vermeden geri geliyordu.
+            var payload = line[5..].TrimStart();
+            if (payload.Length == 0) continue;
+            if (payload.AsSpan().Trim().SequenceEqual("[DONE]")) break;
+
+            dataLines++;
 
             JsonDocument doc;
             try { doc = JsonDocument.Parse(payload); }
@@ -909,29 +1421,34 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
                 if (root.TryGetProperty("error", out var err))
                     throw new InvalidOperationException($"stream error — {err}");
 
-                if (root.TryGetProperty("choices", out var choices) && choices.GetArrayLength() > 0
-                    && choices[0].TryGetProperty("delta", out var delta)
-                    && delta.ValueKind == JsonValueKind.Object)
+                if (root.TryGetProperty("choices", out var choices) && choices.GetArrayLength() > 0)
                 {
-                    // --- reasoning kanalı ---
-                    // Farklı sunucular farklı isim kullanıyor; ikisini de tara.
-                    var reasoningChunk = ReadStringProp(delta, "reasoning_content")
-                                      ?? ReadStringProp(delta, "reasoning");
-
-                    if (!string.IsNullOrEmpty(reasoningChunk))
+                    if (choices[0].TryGetProperty("delta", out var delta)
+                        && delta.ValueKind == JsonValueKind.Object)
                     {
-                        if (ttftAny < 0) ttftAny = sw.Elapsed.TotalMilliseconds;
-                        reasoningSb.Append(reasoningChunk);
+                        // --- reasoning kanalı ---
+                        // Farklı sunucular farklı isim kullanıyor; ikisini de tara.
+                        var reasoningChunk = ReadStringProp(delta, "reasoning_content")
+                                          ?? ReadStringProp(delta, "reasoning");
+
+                        if (!string.IsNullOrEmpty(reasoningChunk))
+                        {
+                            if (ttftAny < 0) ttftAny = sw.Elapsed.TotalMilliseconds;
+                            reasoningSb.Append(reasoningChunk);
+                        }
+
+                        // --- görünür içerik kanalı ---
+                        var contentChunk = ReadStringProp(delta, "content");
+                        if (!string.IsNullOrEmpty(contentChunk))
+                        {
+                            if (ttftAny < 0) ttftAny = sw.Elapsed.TotalMilliseconds;
+                            if (ttftContent < 0) ttftContent = sw.Elapsed.TotalMilliseconds;
+                            contentSb.Append(contentChunk);
+                        }
                     }
 
-                    // --- görünür içerik kanalı ---
-                    var contentChunk = ReadStringProp(delta, "content");
-                    if (!string.IsNullOrEmpty(contentChunk))
-                    {
-                        if (ttftAny < 0) ttftAny = sw.Elapsed.TotalMilliseconds;
-                        if (ttftContent < 0) ttftContent = sw.Elapsed.TotalMilliseconds;
-                        contentSb.Append(contentChunk);
-                    }
+                    var fr = ReadStringProp(choices[0], "finish_reason");
+                    if (!string.IsNullOrEmpty(fr)) finishReason = fr;
                 }
 
                 // usage genelde son chunk'ta gelir; her chunk'ta okuyup üzerine yazıyoruz.
@@ -945,18 +1462,26 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
         sw.Stop();
         var totalMs = sw.Elapsed.TotalMilliseconds;
 
-        if (ttftAny < 0) ttftAny = totalMs;
+        // ttftAny = -1 KORUNUYOR. Eskiden totalMs'e düşürülüyordu; bu, dosyanın
+        // başında v1'in ana hatası olarak tarif edilen ttft == total durumunu
+        // bayraksız üretiyor ve regresyona gerçek ölçüm gibi giriyordu.
+        // ttftContent = -1 de aynı sebeple bırakılıyor: hiç görünür içerik
+        // üretilmedi demek. 0 yazmak "anında geldi" gibi okunur ve CSV'yi
+        // sessizce yalanlar. Eksik veriyi eksik olarak kaydet.
 
-        // ttftContent = -1 bırakılıyor: hiç görünür içerik üretilmedi demek.
-        // 0 yazmak "anında geldi" gibi okunur ve CSV'yi sessizce yalanlar.
-        // Eksik veriyi eksik olarak kaydet.
+        if (dataLines == 0)
+            throw new InvalidOperationException(
+                "stream'den hiç 'data:' satırı okunamadı — SSE formatı beklenenden farklı.");
 
-        if (ct == 0)
+        // Sunucu usage göndermediyse token sayısını TAHMİN ediyoruz, ama bunu
+        // bayrakla işaretliyoruz: tahmin ile ölçüm CSV'de ayırt edilebilsin.
+        var estimated = ct == 0;
+        if (estimated)
             ct = Math.Max(1, (contentSb.Length + reasoningSb.Length) / 3);
 
         return new StreamResult(
             contentSb.ToString(), reasoningSb.ToString(),
-            pt, ct, rt, ttftAny, ttftContent, totalMs);
+            pt, ct, rt, ttftAny, ttftContent, totalMs, finishReason, estimated);
     }
 
     // ------------------------------------------------------------------------
@@ -1015,11 +1540,20 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
 
         return (p, c, r);
 
+        // GetInt32 korumasızdı: usage alanı "128.0" gibi ondalıklı ya da
+        // int.MaxValue üstü gelirse FormatException atıyor ve bu istisna
+        // aşağıdaki JsonException catch'i tarafından yakalanmıyordu.
         static int ReadInt(JsonElement el, string name)
-            => el.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : 0;
-    }
+        {
+            if (!el.TryGetProperty(name, out var v) || v.ValueKind != JsonValueKind.Number)
+                return 0;
 
-    static string TruncStatic(string s, int max) => s.Length <= max ? s : s[..max] + "...";
+            if (v.TryGetInt32(out var i)) return i;
+            if (v.TryGetDouble(out var d) && d >= 0 && d <= int.MaxValue) return (int)Math.Round(d);
+
+            return 0;
+        }
+    }
 }
 
 
@@ -1035,7 +1569,8 @@ record ChatResult(
     int PromptTokens,
     int CompletionTokens,
     int ReasoningTokens,
-    double TotalMs);
+    double TotalMs,
+    string FinishReason);   // "stop" | "length" | ... ; "" = sunucu bildirmedi
 
 record StreamResult(
     string Text,
@@ -1043,9 +1578,11 @@ record StreamResult(
     int PromptTokens,
     int CompletionTokens,
     int ReasoningTokens,
-    double TtftAnyMs,
+    double TtftAnyMs,       // -1 = hiç token gelmedi, ölçülemedi
     double TtftContentMs,   // -1 = hiç görünür içerik üretilmedi
-    double TotalMs);
+    double TotalMs,
+    string FinishReason,
+    bool CompletionTokensEstimated);   // true = sunucu usage göndermedi, TAHMİN
 
 
 // ============================================================================
@@ -1090,6 +1627,45 @@ static class Stats
         var slope = Math.Abs(den) < 1e-9 ? 0 : num / den;
         return (slope, my - slope * mx);
     }
+
+    /// <summary>
+    /// Belirlilik katsayısı. LinearFit tek başına uyumun İYİ olup olmadığını
+    /// söylemiyordu: den ~ 0 iken sessizce eğim 0 dönüyor ve bu değer gerçek
+    /// ölçüm gibi raporlanıyordu. Katsayıyı R² ile birlikte bas.
+    /// </summary>
+    public static double RSquared(IEnumerable<double> xs, IEnumerable<double> ys, double slope, double intercept)
+    {
+        var x = xs.ToArray();
+        var y = ys.ToArray();
+        if (x.Length < 2 || x.Length != y.Length) return double.NaN;
+
+        var my = y.Average();
+        var ssTot = y.Sum(v => (v - my) * (v - my));
+        if (ssTot < 1e-12) return double.NaN;
+
+        var ssRes = x.Zip(y, (a, b) => b - (slope * a + intercept)).Sum(e => e * e);
+        return 1 - ssRes / ssTot;
+    }
+}
+
+
+// ============================================================================
+// Metin yardımcıları
+// ============================================================================
+
+static class Text
+{
+    public static string Trunc(string s, int max)
+    {
+        if (string.IsNullOrEmpty(s) || s.Length <= max) return s ?? "";
+
+        // UTF-16 kod birimiyle kesmek surrogate çiftini bölebilir; sınırı bir
+        // birim geri alıp yarım karakter üretmiyoruz.
+        var cut = max;
+        if (char.IsHighSurrogate(s[cut - 1])) cut--;
+
+        return s[..cut] + "...";
+    }
 }
 
 
@@ -1099,23 +1675,66 @@ static class Stats
 
 static class Csv
 {
+    /// <summary>
+    /// Aynı ada VARSA satırları ekler, üzerine yazmaz. Her satırda run_id
+    /// olduğu için koşular gerçekten karşılaştırılabilir hale geliyor —
+    /// eskiden File.WriteAllText ile her koşu bir öncekini uyarısız siliyor,
+    /// buna rağmen "koşular karşılaştırılabilir" deniyordu.
+    ///
+    /// Başlık değiştiyse (şema güncellendi) eski dosyaya eklemek veriyi
+    /// bozar; o durumda eskisi .bak olarak saklanıp yeni dosya açılıyor.
+    /// </summary>
     public static void Write(Config config, string name, string[] header, List<string[]> rows)
     {
         var path = Path.Combine(config.OutputDir, $"{name}.csv");
-        var sb = new StringBuilder();
+        var headerLine = string.Join(",", header.Select(Escape));
+        var append = false;
 
-        sb.AppendLine(string.Join(",", header.Select(Escape)));
+        if (File.Exists(path))
+        {
+            var existingHeader = File.ReadLines(path, new UTF8Encoding(true)).FirstOrDefault()?.TrimStart('﻿');
+
+            if (existingHeader == headerLine)
+            {
+                append = true;
+            }
+            else
+            {
+                var backup = path + ".bak";
+                File.Move(path, backup, overwrite: true);
+                Console.WriteLine($"   NOT: {name}.csv şeması değişmiş, eskisi {name}.csv.bak olarak saklandı.");
+            }
+        }
+
+        var sb = new StringBuilder();
+        if (!append) sb.AppendLine(headerLine);
         foreach (var r in rows) sb.AppendLine(string.Join(",", r.Select(Escape)));
 
         // BOM: Excel Türkçe karakterleri doğru okusun.
-        File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
-        Console.WriteLine($"-> {path}");
+        if (append)
+            File.AppendAllText(path, sb.ToString(), new UTF8Encoding(true));
+        else
+            File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
+
+        Console.WriteLine($"-> {path}{(append ? $" (+{rows.Count} satır eklendi)" : "")}");
     }
 
     static string Escape(string v)
-        => v.Contains(',') || v.Contains('"') || v.Contains('\n')
-            ? "\"" + v.Replace("\"", "\"\"") + "\""
-            : v;
+    {
+        v ??= "";
+
+        // '\r' de tırnaklanmalı: tek başına gelen bir CR, BOM'lu (Excel hedefli)
+        // dosyada satır yapısını bozuyordu.
+        var needsQuote = v.Contains(',') || v.Contains('"') || v.Contains('\n') || v.Contains('\r');
+
+        // Formül enjeksiyonu: '=', '+', '-', '@' ile başlayan hücreleri Excel
+        // formül sanıyor. ModelId ve elle doldurulan kolonlar sunucudan/insandan
+        // geliyor, tırnak içine alıp başına ' koyarak nötrleştiriyoruz.
+        if (v.Length > 0 && (v[0] is '=' or '+' or '@'))
+            return "\"'" + v.Replace("\"", "\"\"") + "\"";
+
+        return needsQuote ? "\"" + v.Replace("\"", "\"\"") + "\"" : v;
+    }
 }
 
 
@@ -1131,6 +1750,15 @@ sealed class Config
     public int DocWords { get; init; } = 2000;
     public HashSet<int> Experiments { get; init; } = [1, 2, 3, 4, 5, 6];
 
+    public const string Usage =
+        "Kullanım: dotnet run -- [--url <adres>] [--model <id>] [--out <klasör>] " +
+        "[--doc-words <sayı>] [1..6 ...]";
+
+    /// <summary>
+    /// Argüman ayrıştırma. Tanınmayan her şey artık HATA: '--modle qwen' gibi bir
+    /// yazım hatası sessizce yutulup otomatik model keşfine düşürüyordu, 'dotnet
+    /// run -- 7' ise hiçbir deney seçmediği için hepsini koşturuyordu.
+    /// </summary>
     public static Config Parse(string[] args)
     {
         var url = "http://localhost:1234/v1";
@@ -1138,29 +1766,51 @@ sealed class Config
         var outDir = "results";
         var docWords = 2000;
         var exps = new HashSet<int>();
+        var errors = new List<string>();
 
         for (var i = 0; i < args.Length; i++)
         {
-            switch (args[i])
+            var arg = args[i];
+
+            switch (arg)
             {
-                case "--url" when i + 1 < args.Length:
-                    url = args[++i];
+                case "--url":
+                case "--model":
+                case "--out":
+                case "--doc-words":
+                    if (i + 1 >= args.Length)
+                    {
+                        errors.Add($"{arg} bir değer bekliyor ama argüman listesi bitti");
+                        break;
+                    }
+
+                    var value = args[++i];
+
+                    if (arg == "--url") url = value;
+                    else if (arg == "--model") model = value;
+                    else if (arg == "--out") outDir = value;
+                    else if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out docWords) || docWords < 1)
+                        errors.Add($"--doc-words pozitif bir tamsayı olmalı, '{value}' geldi");
+
                     break;
-                case "--model" when i + 1 < args.Length:
-                    model = args[++i];
-                    break;
-                case "--out" when i + 1 < args.Length:
-                    outDir = args[++i];
-                    break;
-                case "--doc-words" when i + 1 < args.Length:
-                    if (int.TryParse(args[i + 1], out var dw)) docWords = dw;
-                    i++;
-                    break;
+
                 default:
-                    if (int.TryParse(args[i], out var n) && n is >= 1 and <= 6) exps.Add(n);
+                    if (int.TryParse(arg, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n))
+                    {
+                        if (n is >= 1 and <= 6) exps.Add(n);
+                        else errors.Add($"deney numarası 1-6 aralığında olmalı, '{n}' geldi");
+                    }
+                    else
+                    {
+                        errors.Add($"tanınmayan argüman: '{arg}'");
+                    }
+
                     break;
             }
         }
+
+        if (errors.Count > 0)
+            throw new ArgumentException(string.Join("\n  - ", errors.Prepend("Argüman hatası:")));
 
         return new Config
         {
