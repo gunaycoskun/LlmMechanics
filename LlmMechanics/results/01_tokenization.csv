@@ -1,6 +1,0 @@
-﻿run_id,model,metin,tr_tokens,en_tokens,oran,tr_karakter,en_karakter,tr_kar_per_token,en_kar_per_token,sablon_sabiti_token,tr_net_tokens,en_net_tokens,net_oran
-20260909-103150,qwen/qwen3.5-9b,kisa_cumle,31,24,1.2917,56,86,1.806,3.583,10,21,14,1.5000
-20260909-103150,qwen/qwen3.5-9b,teknik_paragraf,72,60,1.2000,238,285,3.306,4.750,10,62,50,1.2400
-20260909-103150,qwen/qwen3.5-9b,liste,39,26,1.5000,88,83,2.256,3.192,10,29,16,1.8125
-20260909-103150,qwen/qwen3.5-9b,sayisal,56,50,1.1200,78,91,1.393,1.820,10,46,40,1.1500
-20260909-103150,qwen/qwen3.5-9b,uzun_madde,92,76,1.2105,313,359,3.402,4.724,10,82,66,1.2424

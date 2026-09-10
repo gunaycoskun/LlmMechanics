@@ -1,5 +1,0 @@
-﻿run_id,model,kol,temperature,seed,n,benzersiz_cikti,ilk_ile_ayni_yuzde,ort_karakter,bos_cikti_sayisi
-20260908-160941,qwen/qwen3.5-9b,temp0_seed_sabit,0.0,42,20,1,100.0,113,0
-20260908-160941,qwen/qwen3.5-9b,temp0_seed_yok,0.0,,20,1,100.0,113,0
-20260908-160941,qwen/qwen3.5-9b,temp08_seed_yok,0.8,,20,20,5.0,198,0
-20260908-160941,qwen/qwen3.5-9b,temp18_seed_yok,1.8,,20,20,5.0,211,1
