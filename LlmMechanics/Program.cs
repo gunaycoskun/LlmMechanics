@@ -1,28 +1,32 @@
 ﻿// ============================================================================
-// Faz 1 — LLM Mekanikleri Ölçüm Harness'ı v2 (Lokal / LM Studio)
+// Phase 1 — LLM Mechanics Measurement Harness v2 (Local / LM Studio)
 //
-// v1'de bulunan hata: Qwen3.5 bir reasoning modeli. Düşünme token'larını
-// delta.content içinde DEĞİL, delta.reasoning_content içinde yayınlıyor.
-// v1 sadece content'e baktığı için:
-//   - tüm çıktılar boş göründü (Deney 3 ve 6)
-//   - TTFT damgası üretimin SONUNA düştü, ttft == total oldu (Deney 2 ve 4)
+// Bug found in v1: Qwen3.5 is a reasoning model. It emits thinking tokens in
+// delta.reasoning_content, NOT in delta.content. Because v1 only looked at
+// content:
+//   - all outputs appeared empty (Experiments 3 and 6)
+//   - the TTFT stamp landed at the END of generation, ttft == total (Exp. 2 and 4)
 //
-// v2'de düzeltilenler:
-//   1. reasoning_content ayrı kanal olarak okunuyor (stream + non-stream)
-//   2. İki ayrı TTFT: TtftAny (fiziksel prefill) / TtftContent (algılanan gecikme)
-//   3. Düşünmeyi kapatmak için üç yol DENENİYOR ve sonucu ön kontrolde
-//      raporlanıyor: chat_template_kwargs.enable_thinking, /no_think sistem
-//      mesajı, ve (LM Studio tarafında) Reasoning Budget. qwen3.5-9b üzerinde
-//      ÜÇÜ DE ETKİSİZ — kod bunu tespit edip ölçümleri düşünme açık koşuyor.
-//   4. Deney 2 A kolu max_tokens 16 -> 64 (marjsız değildi)
-//   5. Deney 4 uzun context'e taşındı (kısa prompt'ta KV cache etkisi gürültüdeydi)
-//   6. Deney 5'e 16 paralellik seviyesi eklendi (eğri doymamıştı)
-//   7. Deney 6 düşünme kapatılabiliyorsa iki kol, kapatılamıyorsa tek kol koşuyor
+// Fixed in v2:
+//   1. reasoning_content is read as a separate channel (stream + non-stream)
+//   2. Two distinct TTFTs: TtftAny (physical prefill) / TtftContent (perceived
+//      latency)
+//   3. Three ways of turning thinking off are ATTEMPTED and the outcome is
+//      reported in the pre-flight check: chat_template_kwargs.enable_thinking,
+//      the /no_think system message, and (on the LM Studio side) Reasoning
+//      Budget. On qwen3.5-9b ALL THREE ARE INEFFECTIVE — the code detects this
+//      and runs the measurements with thinking enabled.
+//   4. Experiment 2 arm A max_tokens 16 -> 64 (16 left no headroom)
+//   5. Experiment 4 moved to a long context (with a short prompt the KV cache
+//      effect was buried in noise)
+//   6. A concurrency level of 16 was added to Experiment 5 (the curve had not
+//      saturated)
+//   7. Experiment 6 runs two arms if thinking can be disabled, one arm if not
 //
-// Bağımlılık yok. Ham HttpClient kullanıyoruz çünkü abstraction, tam da
-// ölçmek istediğimiz sağlayıcı farklarını normalize eder.
+// No dependencies. We use a raw HttpClient because an abstraction would
+// normalize exactly the provider differences we want to measure.
 //
-// Çalıştırma:
+// Running it:
 //   dotnet run -- --model qwen/qwen3.5-9b
 //   dotnet run -- --model qwen/qwen3.5-9b 2 3 4
 //   dotnet run -- --url http://localhost:1234/v1 --out results2 --doc-words 2000
@@ -58,12 +62,12 @@ try
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine($"HATA: çıktı klasörü oluşturulamadı ({config.OutputDir}) — {ex.Message}");
+    Console.Error.WriteLine($"ERROR: could not create the output directory ({config.OutputDir}) — {ex.Message}");
     return 1;
 }
 
 Console.WriteLine($"Base URL : {config.BaseUrl}");
-Console.WriteLine($"Model    : {(string.IsNullOrWhiteSpace(config.ModelId) ? "(otomatik keşif)" : config.ModelId)}");
+Console.WriteLine($"Model    : {(string.IsNullOrWhiteSpace(config.ModelId) ? "(auto-discovery)" : config.ModelId)}");
 
 if (string.IsNullOrWhiteSpace(config.ModelId))
 {
@@ -74,25 +78,25 @@ if (string.IsNullOrWhiteSpace(config.ModelId))
     }
     catch (Exception ex)
     {
-        // Buraya gelen istisna eskiden yakalanmıyordu: LM Studio kapalıyken
-        // program yığın iziyle düşüyor, aşağıdaki yardımcı mesaj hiç görünmüyordu.
-        Console.Error.WriteLine($"HATA: model listesi alınamadı — {ex.Message}");
-        Console.Error.WriteLine($"      Sunucu adresi: {config.BaseUrl}");
-        Console.Error.WriteLine("      LM Studio > Developer > Status: Running ve model yüklü olmalı.");
+        // This exception used to go uncaught: with LM Studio closed the program
+        // died with a stack trace and the helpful message below never appeared.
+        Console.Error.WriteLine($"ERROR: could not fetch the model list — {ex.Message}");
+        Console.Error.WriteLine($"       Server address: {config.BaseUrl}");
+        Console.Error.WriteLine("       LM Studio > Developer > Status: Running, and a model must be loaded.");
         return 1;
     }
 
     if (models.Count == 0)
     {
-        Console.Error.WriteLine("HATA: Sunucuda model yok. LM Studio > Developer > Status: Running ve model yüklü olmalı.");
+        Console.Error.WriteLine("ERROR: no models on the server. LM Studio > Developer > Status: Running, and a model must be loaded.");
         return 1;
     }
 
-    Console.WriteLine("\nBulunan modeller:");
+    Console.WriteLine("\nModels found:");
     foreach (var m in models) Console.WriteLine($"  - {m}");
 
-    // Yalnızca 'embed' elemek yetmiyordu; rerank/whisper gibi chat olmayan
-    // modeller filtreyi geçip sessizce seçilebiliyordu.
+    // Filtering out only 'embed' was not enough; non-chat models such as
+    // rerank/whisper passed the filter and could be selected silently.
     string[] notChat = ["embed", "rerank", "whisper", "clip", "vae", "tts"];
 
     var chatCandidates = models
@@ -101,50 +105,50 @@ if (string.IsNullOrWhiteSpace(config.ModelId))
 
     if (chatCandidates.Count == 0)
     {
-        Console.Error.WriteLine("HATA: Chat modeli bulunamadı (hepsi embedding/rerank görünüyor).");
-        Console.Error.WriteLine("      --model ile açıkça belirt.");
+        Console.Error.WriteLine("ERROR: no chat model found (they all look like embedding/rerank models).");
+        Console.Error.WriteLine("       Name one explicitly with --model.");
         return 1;
     }
 
     if (chatCandidates.Count > 1)
-        Console.WriteLine($"UYARI: {chatCandidates.Count} chat adayı var, ilki seçiliyor. " +
-                          "Koşular arası tutarlılık için --model kullan.");
+        Console.WriteLine($"WARNING: {chatCandidates.Count} chat candidates found, picking the first. " +
+                          "Use --model for consistency across runs.");
 
     client.ModelId = chatCandidates[0];
-    Console.WriteLine($"\nSeçilen chat modeli: {client.ModelId}");
+    Console.WriteLine($"\nSelected chat model: {client.ModelId}");
 }
 
 var runId = DateTime.Now.ToString("yyyyMMdd-HHmmss");
 Console.WriteLine($"Run ID   : {runId}");
 
 // ----------------------------------------------------------------------------
-// ÖN KONTROL — reasoning kanalı ve enable_thinking desteği
+// PRE-FLIGHT CHECK — reasoning channel and enable_thinking support
 //
-// Bunu ölçümden ÖNCE doğruluyoruz. v1'in tüm hatası "varsaydım" yüzündendi.
+// We verify this BEFORE measuring. Every v1 bug came from "I assumed".
 // ----------------------------------------------------------------------------
 
-// Warm-up ÖN KONTROLDEN ÖNCE: ilk çağrı model yükleme + CUDA context init +
-// kernel derlemesi maliyetini üstleniyor. Ön kontrol önce koşarsa bastığı
-// ttftAny bu soğuk maliyeti gösterir (ölçülen fark 2413 ms'e karşı 65 ms) ve
-// kullanıcı yanlış bir taban çizgisi okur.
-Console.WriteLine("\nWarm-up (3 çağrı, ölçüme dahil değil)...");
+// Warm-up BEFORE the pre-flight check: the first call absorbs model loading,
+// CUDA context init and kernel compilation. If the pre-flight check ran first,
+// the ttftAny it prints would reflect that cold cost (measured difference:
+// 2413 ms versus 65 ms) and the user would read a wrong baseline.
+Console.WriteLine("\nWarm-up (3 calls, excluded from measurements)...");
 try
 {
     for (var i = 0; i < 3; i++)
-        await client.ChatAsync([new Message("user", "Merhaba.")], 16, 0, disableThinking: true);
+        await client.ChatAsync([new Message("user", "Hello.")], 16, 0, disableThinking: true);
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine($"\nHATA: warm-up çağrısı başarısız — {ex.Message}");
-    Console.Error.WriteLine($"      Sunucuya ulaşılamıyor olabilir: {config.BaseUrl}");
-    Console.Error.WriteLine("      LM Studio > Developer > Status: Running ve model yüklü mü?");
+    Console.Error.WriteLine($"\nERROR: warm-up call failed — {ex.Message}");
+    Console.Error.WriteLine($"       The server may be unreachable: {config.BaseUrl}");
+    Console.Error.WriteLine("       LM Studio > Developer > Status: Running, and is a model loaded?");
     return 1;
 }
-Console.WriteLine("Warm-up tamam.");
+Console.WriteLine("Warm-up done.");
 
-Header("ÖN KONTROL — reasoning kanalı ve enable_thinking");
+Header("PRE-FLIGHT CHECK — reasoning channel and enable_thinking");
 
-const string probePrompt = "Hakediş nedir? Tek cümle.";
+const string probePrompt = "What is a progress payment? One sentence.";
 
 StreamResult probeOn, probeOff;
 try
@@ -152,8 +156,8 @@ try
     probeOn = await client.ChatStreamAsync(
         [new Message("user", probePrompt)], maxTokens: 300, temperature: 0);
 
-    Console.WriteLine($"Düşünme AÇIK  : content={probeOn.Text.Length} kar, " +
-                      $"reasoning={probeOn.Reasoning.Length} kar, " +
+    Console.WriteLine($"Thinking ON  : content={probeOn.Text.Length} chars, " +
+                      $"reasoning={probeOn.Reasoning.Length} chars, " +
                       $"reasoning_tokens={probeOn.ReasoningTokens}, " +
                       $"ttftAny={Fmt(probeOn.TtftAnyMs)}, ttftContent={Fmt(probeOn.TtftContentMs)}");
 
@@ -161,26 +165,26 @@ try
         [new Message("user", probePrompt)], maxTokens: 300, temperature: 0,
         disableThinking: true);
 
-    Console.WriteLine($"Düşünme KAPALI: content={probeOff.Text.Length} kar, " +
-                      $"reasoning={probeOff.Reasoning.Length} kar, " +
+    Console.WriteLine($"Thinking OFF : content={probeOff.Text.Length} chars, " +
+                      $"reasoning={probeOff.Reasoning.Length} chars, " +
                       $"reasoning_tokens={probeOff.ReasoningTokens}, " +
                       $"ttftAny={Fmt(probeOff.TtftAnyMs)}, ttftContent={Fmt(probeOff.TtftContentMs)}");
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine($"\nHATA: ön kontrol çağrısı başarısız — {ex.Message}");
-    Console.Error.WriteLine($"      Sunucuya ulaşılamıyor olabilir: {config.BaseUrl}");
-    Console.Error.WriteLine("      LM Studio > Developer > Status: Running ve model yüklü mü?");
+    Console.Error.WriteLine($"\nERROR: pre-flight call failed — {ex.Message}");
+    Console.Error.WriteLine($"       The server may be unreachable: {config.BaseUrl}");
+    Console.Error.WriteLine("       LM Studio > Developer > Status: Running, and is a model loaded?");
     return 1;
 }
 
-// Bazı sunucular reasoning'i ayrı alanda değil, content içinde <think>...</think>
-// olarak yayınlıyor. Bunu kontrol etmezsek "düşünme kapandı" diye yanlış karar
-// verir, ttftAny'yi ilk content token'ına damgalar ve tüm katsayıları kirletiriz.
+// Some servers emit reasoning inside content as <think>...</think> rather than
+// in a separate field. Without this check we would wrongly conclude "thinking
+// is off", stamp ttftAny on the first content token and pollute every coefficient.
 var inlineThink = probeOff.Text.Contains("<think", StringComparison.OrdinalIgnoreCase);
 
 if (inlineThink)
-    Console.WriteLine("UYARI: content içinde <think> bloğu görüldü — reasoning ayrı kanalda gelmiyor.");
+    Console.WriteLine("WARNING: a <think> block was seen inside content — reasoning is not arriving on a separate channel.");
 
 var thinkingOff = probeOff.Reasoning.Length == 0 && probeOff.Text.Length > 0 && !inlineThink;
 client.CanDisableThinking = thinkingOff;
@@ -188,20 +192,20 @@ client.CanDisableThinking = thinkingOff;
 if (!thinkingOff)
 {
     Console.WriteLine();
-    Console.WriteLine("UYARI: enable_thinking=false etkisiz. /no_think fallback'i deneniyor...");
+    Console.WriteLine("WARNING: enable_thinking=false has no effect. Trying the /no_think fallback...");
 
-    // DİKKAT: burası bir zamanlar `= false` yazıyordu; property'nin varsayılanı da
-    // false olduğu için fallback hiç devreye girmiyor, aşağıdaki probe da birebir
-    // aynı isteği tekrarlıyordu — yani "fallback işe yaramadı" sonucu denenmemiş
-    // bir yoldan çıkarılmış oluyordu.
+    // CAREFUL: this once read `= false`; since the property already defaults to
+    // false the fallback never engaged and the probe below repeated the exact
+    // same request — meaning "the fallback did not work" was concluded from a
+    // path that was never taken.
     client.UseNoThinkFallback = true;
 
     var probeOff2 = await client.ChatStreamAsync(
         [new Message("user", probePrompt)], maxTokens: 300, temperature: 0,
         disableThinking: true);
 
-    Console.WriteLine($"Fallback ile  : content={probeOff2.Text.Length} kar, " +
-                      $"reasoning={probeOff2.Reasoning.Length} kar");
+    Console.WriteLine($"With fallback: content={probeOff2.Text.Length} chars, " +
+                      $"reasoning={probeOff2.Reasoning.Length} chars");
 
     var fallbackWorks = probeOff2.Reasoning.Length == 0 && probeOff2.Text.Length > 0
                         && !probeOff2.Text.Contains("<think", StringComparison.OrdinalIgnoreCase);
@@ -210,35 +214,36 @@ if (!thinkingOff)
 
     if (fallbackWorks)
     {
-        Console.WriteLine("       /no_think fallback'i ÇALIŞIYOR, ölçümlerde kullanılacak.");
-        Console.WriteLine("       Not: bu her prompt'a sabit bir system turu ekler ve Deney 1'in");
-        Console.WriteLine("       token sayılarını iki tarafta da şişirir (oranı 1'e yaklaştırır).");
+        Console.WriteLine("       The /no_think fallback WORKS and will be used in the measurements.");
+        Console.WriteLine("       Note: it adds a fixed system turn to every prompt and inflates");
+        Console.WriteLine("       Experiment 1's token counts on both sides (pushing the ratio toward 1).");
     }
     else
     {
-        // Geri al. Açık bırakılırsa hiçbir fayda sağlamadan bütün prompt'lara
-        // sabit bir system turu ekler — Deney 1'in TR/EN oranını bozan tam da bu.
+        // Roll it back. Left enabled it adds a fixed system turn to every prompt
+        // for no benefit — that is exactly what distorted Experiment 1's ratio.
         client.UseNoThinkFallback = false;
-        Console.WriteLine("       Fallback da işe yaramadı, geri alındı. Ölçümler düşünme AÇIK koşacak.");
-        Console.WriteLine("       README'ye bu notu düş — katsayılar reasoning dahil demektir.");
+        Console.WriteLine("       The fallback did not work either; rolled back. Measurements will run with thinking ON.");
+        Console.WriteLine("       Add this note to the README — the coefficients include reasoning.");
     }
 }
 
 if (probeOn.Text.Length == 0 && probeOn.Reasoning.Length == 0)
 {
-    Console.Error.WriteLine("\nHATA: Model hiç içerik üretmedi. Model yüklü mü, context ayarı doğru mu?");
+    Console.Error.WriteLine("\nERROR: the model produced no content at all. Is a model loaded, is the context setting correct?");
     return 1;
 }
 
 // ----------------------------------------------------------------------------
-// Not: warm-up yukarıda, ön kontrolden ÖNCE koşuyor — ilk çağrılar model
-// yükleme, CUDA context init ve kernel derlemesini içerir. Gemini'de bu maliyet
-// yoktu (sunucu zaten sıcaktı); lokalde en büyük outlier kaynağı bu.
+// Note: the warm-up above runs BEFORE the pre-flight check — the first calls
+// include model loading, CUDA context init and kernel compilation. On Gemini
+// this cost did not exist (the server was already warm); locally it is the
+// single largest source of outliers.
 // ----------------------------------------------------------------------------
 
-// Her deney kendi try/catch'inde koşuyor: Deney 2'de 50, Deney 3'te 80 sıralı
-// çağrı var; birinde 500 alınca tüm koşunun çöpe gitmesi ve sonraki deneylerin
-// hiç koşmaması ölçüm saatlerini yakıyordu.
+// Each experiment runs in its own try/catch: Experiment 2 makes 50 and
+// Experiment 3 makes 80 sequential calls; a single 500 throwing away the whole
+// run and preventing later experiments from running burned measurement hours.
 var sel = config.Experiments;
 var failedExperiments = new List<int>();
 
@@ -258,16 +263,16 @@ async Task Run(int no, Func<Task> body)
     catch (Exception ex)
     {
         failedExperiments.Add(no);
-        Console.Error.WriteLine($"\nHATA: Deney {no} yarıda kaldı — {ex.GetType().Name}: {ex.Message}");
-        Console.Error.WriteLine("      Bu deneyin CSV'si yazılmadı. Sonraki deneylere devam ediliyor.");
+        Console.Error.WriteLine($"\nERROR: Experiment {no} aborted — {ex.GetType().Name}: {ex.Message}");
+        Console.Error.WriteLine("       No CSV was written for this experiment. Continuing with the next ones.");
     }
 }
 
-Console.WriteLine($"\nTamamlandı. Çıktılar: {Path.GetFullPath(config.OutputDir)}");
+Console.WriteLine($"\nDone. Outputs: {Path.GetFullPath(config.OutputDir)}");
 
 if (failedExperiments.Count > 0)
 {
-    Console.Error.WriteLine($"UYARI: başarısız deneyler: {string.Join(", ", failedExperiments)}");
+    Console.Error.WriteLine($"WARNING: failed experiments: {string.Join(", ", failedExperiments)}");
     return 2;
 }
 
@@ -275,29 +280,35 @@ return 0;
 
 
 // ============================================================================
-// DENEY 1 — Tokenization: Türkçe token cezası
+// EXPERIMENT 1 — Tokenization: the Turkish token penalty
 //
-// Gemini'de Türkçe İngilizceye göre 1.33x token tüketiyordu (BPE vocabulary
-// bias). Qwen çok dilli veriyle eğitildi; çarpanın düşük olmasını bekliyoruz.
+// On Gemini, Turkish consumed 1.33x the tokens of English (BPE vocabulary
+// bias). Qwen was trained on multilingual data; we expect a lower multiplier.
 //
-// YORUM UYARISI: prompt_tokens chat template overhead'ini de içerir (~15-20
-// token, iki tarafta da sabit). Sabit terim hem payı hem paydayı şişirdiği için
-// ölçülen oran gerçek metin-içi orandan DÜŞÜK çıkar. Bu deney alt sınırı verir.
+// INTERPRETATION WARNING: prompt_tokens also includes the chat template
+// overhead (~15-20 tokens, constant on both sides). Because a constant term
+// inflates both numerator and denominator, the measured ratio comes out LOWER
+// than the true in-text ratio. This experiment gives a lower bound.
 //
-// Neden önemli: KİK/hakediş dokümanları Türkçe. Çarpan, context'e kaç sayfa
-// sözleşme sığdığını ve chunk boyutunu belirliyor.
+// Why it matters: public-procurement / progress-payment documents are in
+// Turkish. The multiplier determines how many pages of contract fit in the
+// context and how large a chunk can be.
 // ============================================================================
 static async Task Experiment1_Tokenization(LmClient client, Config config, string runId)
 {
-    Header("DENEY 1 — Tokenization: Türkçe token cezası");
+    Header("EXPERIMENT 1 — Tokenization: the Turkish token penalty");
 
+    // The Turkish side is measurement data, NOT user-facing text: this
+    // experiment exists to compare Turkish against English tokenization, so
+    // translating it would collapse the ratio to ~1.0 and destroy the
+    // experiment. Leave these strings in Turkish.
     var pairs = new (string Name, string Tr, string En)[]
     {
-        ("kisa_cumle",
+        ("short_sentence",
          "Yüklenici, hakediş raporunu idareye sunmakla yükümlüdür.",
          "The contractor is obliged to submit the progress payment report to the administration."),
 
-        ("teknik_paragraf",
+        ("technical_paragraph",
          "İş artışı halinde, sözleşme bedelinin yüzde yirmisine kadar olan kısım için " +
          "yükleniciye ek süre verilir ve fiyat farkı hesaplaması güncel endeks değerleri " +
          "üzerinden yapılır. İdare, bu kararı gerekçeleriyle birlikte yazılı olarak bildirir.",
@@ -305,15 +316,15 @@ static async Task Experiment1_Tokenization(LmClient client, Config config, strin
          "up to twenty percent of the contract price, and the price difference calculation is made " +
          "based on current index values. The administration notifies this decision in writing with its justification."),
 
-        ("liste",
+        ("list",
          "Belgeler: teklif mektubu, geçici teminat, iş deneyim belgesi, vergi borcu yoktur yazısı.",
          "Documents: bid letter, bid bond, work experience certificate, tax clearance letter."),
 
-        ("sayisal",
+        ("numeric",
          "Sözleşme bedeli 12.450.000,00 TL olup, ilk hakediş tutarı 1.245.000,00 TL'dir.",
          "The contract price is 12,450,000.00 TRY and the first progress payment is 1,245,000.00 TRY."),
 
-        ("uzun_madde",
+        ("long_clause",
          "Sözleşmenin uygulanması sırasında ortaya çıkan ve yüklenicinin kusurundan " +
          "kaynaklanmayan gecikmelerde, idare tarafından yükleniciye süre uzatımı verilebilir. " +
          "Süre uzatımı talebi, gecikmeye neden olan olayın sona ermesinden itibaren yirmi gün " +
@@ -324,43 +335,45 @@ static async Task Experiment1_Tokenization(LmClient client, Config config, strin
          "days from the end of the event causing the delay, and its justifications shall be documented."),
     };
 
-    // --- Şablon sabiti kalibrasyonu ---
-    // Yorumdaki "~15-20 token" şimdiye kadar ÖLÇÜLMEMİŞ bir varsayımdı. Tek
-    // karakterlik bir prompt gönderip prompt_tokens'ı okuyoruz: kalan her şey
-    // chat template overhead'i. Bu sabit hem payı hem paydayı şişirdiği için
-    // ölçülen oranı 1'e doğru itiyor; ölçmeden "alt sınır" demek yetersizdi.
+    // --- Template constant calibration ---
+    // The "~15-20 tokens" in the comment was an assumption that had never been
+    // MEASURED. We send a single-character prompt and read prompt_tokens:
+    // everything left over is chat template overhead. Since that constant
+    // inflates both numerator and denominator it pushes the measured ratio
+    // toward 1; calling it a "lower bound" without measuring it was not enough.
     var calib = await client.ChatAsync([new Message("user", ".")], 1, 0, disableThinking: true);
     var templateOverhead = Math.Max(0, calib.PromptTokens - 1);
 
-    Console.WriteLine($"Şablon sabiti (ölçülen): {templateOverhead} token " +
-                      $"(tek karakterlik prompt = {calib.PromptTokens} prompt_tokens)");
+    Console.WriteLine($"Template constant (measured): {templateOverhead} tokens " +
+                      $"(single-character prompt = {calib.PromptTokens} prompt_tokens)");
     Console.WriteLine();
 
     var rows = new List<string[]>();
 
-    // Özet istatistikler CSV'ye yazılmış STRING'lerden sabit indekslerle geri
-    // parse ediliyordu; kolon eklendiğinde indeks kaydı ve derleyici uyarmadan
-    // yanlış kolonun ortalaması raporlandı. Ölçümleri tipli tutuyoruz.
+    // The summary statistics used to be parsed back out of the STRINGS written
+    // to the CSV using fixed indices; when a column was added the indices
+    // shifted and the average of the wrong column was reported without a
+    // compiler warning. We keep the measurements typed instead.
     var measured = new List<(double Ratio, double NetRatio, int TrTok, int EnTok)>();
 
-    Console.WriteLine($"{"metin",-18} {"TR tok",8} {"EN tok",8} {"oran",8} {"net oran",9} {"TR kar",8} {"EN kar",8}");
+    Console.WriteLine($"{"text",-18} {"TR tok",8} {"EN tok",8} {"ratio",8} {"net ratio",9} {"TR chr",8} {"EN chr",8}");
     Console.WriteLine(new string('-', 72));
 
     foreach (var (name, tr, en) in pairs)
     {
-        // max_tokens=1 + düşünme kapalı: üretim maliyeti minimum,
-        // sadece prompt_tokens'a bakıyoruz.
+        // max_tokens=1 + thinking off: generation cost is minimal,
+        // we only care about prompt_tokens.
         var trRes = await client.ChatAsync([new Message("user", tr)], 1, 0, disableThinking: true);
         var enRes = await client.ChatAsync([new Message("user", en)], 1, 0, disableThinking: true);
 
         if (trRes.PromptTokens == 0 || enRes.PromptTokens == 0)
             throw new InvalidOperationException(
-                $"'{name}' için prompt_tokens 0 geldi — sunucu usage alanını göndermiyor, " +
-                "bu deneyin tüm oranları anlamsız olurdu.");
+                $"prompt_tokens came back 0 for '{name}' — the server is not sending the usage field, " +
+                "which would make every ratio in this experiment meaningless.");
 
         var ratio = (double)trRes.PromptTokens / enRes.PromptTokens;
 
-        // Şablon sabitinden arındırılmış oran: asıl metin-içi ceza bu.
+        // Ratio with the template constant removed: this is the real in-text penalty.
         var trNet = Math.Max(1, trRes.PromptTokens - templateOverhead);
         var enNet = Math.Max(1, enRes.PromptTokens - templateOverhead);
         var netRatio = (double)trNet / enNet;
@@ -382,69 +395,72 @@ static async Task Experiment1_Tokenization(LmClient client, Config config, strin
         measured.Add((ratio, netRatio, trRes.PromptTokens, enRes.PromptTokens));
     }
 
-    // Üç ayrı toplama, üçü de farklı bir soruya cevap veriyor. Tek sayı raporlamak
-    // hangisinin kastedildiğini belirsiz bırakıyordu.
-    var avg = measured.Average(m => m.Ratio);                                            // makro
+    // Three different aggregations, each answering a different question.
+    // Reporting a single number left it ambiguous which one was meant.
+    var avg = measured.Average(m => m.Ratio);                                            // macro
     var max = measured.Max(m => m.Ratio);
     var trTotal = measured.Sum(m => m.TrTok);
     var enTotal = measured.Sum(m => m.EnTok);
-    var micro = (double)trTotal / Math.Max(enTotal, 1);                                  // token ağırlıklı
-    var netAvg = measured.Average(m => m.NetRatio);                                      // şablondan arındırılmış
+    var micro = (double)trTotal / Math.Max(enTotal, 1);                                  // token weighted
+    var netAvg = measured.Average(m => m.NetRatio);                                      // template removed
     var netMax = measured.Max(m => m.NetRatio);
 
     Console.WriteLine(new string('-', 72));
-    Console.WriteLine($"Ham oran      : ortalama {avg:F3} | en kötü {max:F3} | token-ağırlıklı {micro:F3}");
-    Console.WriteLine($"Net oran      : ortalama {netAvg:F3} | en kötü {netMax:F3}   (şablon sabiti çıkarılmış)");
-    Console.WriteLine("Gemini referansı: 1.33. Chunk boyutu hesabını ORTALAMAYA değil");
-    Console.WriteLine("EN KÖTÜ DURUMA göre yap — terim yoğun listeler en pahalı metin tipi.");
-    Console.WriteLine("Chunk planı için NET en kötü durumu kullan: gerçek metin-içi ceza odur.");
+    Console.WriteLine($"Raw ratio     : mean {avg:F3} | worst {max:F3} | token-weighted {micro:F3}");
+    Console.WriteLine($"Net ratio     : mean {netAvg:F3} | worst {netMax:F3}   (template constant removed)");
+    Console.WriteLine("Gemini reference: 1.33. Size your chunks by the WORST CASE, not the");
+    Console.WriteLine("MEAN — term-dense lists are the most expensive kind of text.");
+    Console.WriteLine("Use the NET worst case when planning chunks: that is the real in-text penalty.");
 
     Csv.Write(config, "01_tokenization",
-        ["run_id", "model", "metin", "tr_tokens", "en_tokens", "oran",
-         "tr_karakter", "en_karakter", "tr_kar_per_token", "en_kar_per_token",
-         "sablon_sabiti_token", "tr_net_tokens", "en_net_tokens", "net_oran"],
+        ["run_id", "model", "text", "tr_tokens", "en_tokens", "ratio",
+         "tr_chars", "en_chars", "tr_chars_per_token", "en_chars_per_token",
+         "template_overhead_tokens", "tr_net_tokens", "en_net_tokens", "net_ratio"],
         rows);
 }
 
 
 // ============================================================================
-// DENEY 2 — Prefill / Decode katsayı ayrıştırması
+// EXPERIMENT 2 — Prefill / decode coefficient decomposition
 //
-// Gemini'de model: ~1200ms sabit + ~3ms/token. O sabit maliyet ağ + kuyruktu.
-// Lokalde ağ yok. Yerine iki farklı fiziksel süreç var:
+// On Gemini the model was: ~1200ms constant + ~3ms/token. That constant cost
+// was network + queueing. Locally there is no network. In its place there are
+// two distinct physical processes:
 //
-//   prefill : input token'ları PARALEL işlenir (compute-bound, ucuz)
-//   decode  : output token'ları SIRALI üretilir (memory-bandwidth-bound, pahalı)
+//   prefill : input tokens are processed IN PARALLEL (compute-bound, cheap)
+//   decode  : output tokens are produced SEQUENTIALLY (memory-bandwidth-bound,
+//             expensive)
 //
-// Doğru model:  total ≈ c + a*input_tokens + b*output_tokens
+// The right model:  total ~= c + a*input_tokens + b*output_tokens
 //
-// v1 hatası: b'yi (total - ttft) üzerinden hesaplıyordu; ttft == total olduğu
-// için sıfıra bölüyordu. v2 doğrudan total'i output_tokens'a regresyon ediyor —
-// daha sağlam, ttft'ye bağımlı değil.
+// v1 bug: it computed b from (total - ttft); because ttft == total it was
+// dividing by zero. v2 regresses total directly on output_tokens — more
+// robust, and independent of ttft.
 //
-// Neden önemli: "prompt'u mu kısaltayım, çıktıyı mı" sorusunun sayısal cevabı.
+// Why it matters: it is the numeric answer to "should I shorten the prompt or
+// the output".
 // ============================================================================
 static async Task Experiment2_PrefillDecode(LmClient client, Config config, string runId)
 {
-    Header("DENEY 2 — Prefill / Decode ayrıştırması");
+    Header("EXPERIMENT 2 — Prefill / decode decomposition");
 
     const int reps = 5;
     const int aOutTokens = 64;
 
     var rows = new List<string[]>();
-    var inputSizes = new[] { 1, 20, 100, 400, 1200 };      // yaklaşık kelime
-    var outputSizes = new[] { 32, 64, 128, 256, 512 };     // token
+    var inputSizes = new[] { 1, 20, 100, 400, 1200 };      // approximate word count
+    var outputSizes = new[] { 32, 64, 128, 256, 512 };     // tokens
 
     const double aTemp = 0.0;
     const double bTemp = 0.7;
 
-    // Ölçüm noktası -> satır. Kolonlar 3..7 arası indeksleri aşağıdaki regresyon
-    // kullandığı için sabit; yeni kolonlar SONA ekleniyor.
+    // Measurement point -> row. Columns 3..7 are fixed because the regression
+    // below indexes them; new columns are appended AT THE END.
     void AddRow(string arm, double temp, List<StreamResult> samples, double inTok, double outTok)
     {
-        // ttftAny ölçülemeyen örnekleri (hiç chunk ayrıştırılamadı) dışarıda
-        // bırakıyoruz; totalMs'e düşürüp ortalamaya karıştırmak v1'in ttft==total
-        // hatasını sessizce geri getiriyordu.
+        // Samples whose ttftAny could not be measured (no chunk was parsed) are
+        // left out; folding them down to totalMs and mixing them into the mean
+        // silently reintroduced v1's ttft==total bug.
         var ttfts = samples.Where(s => s.TtftAnyMs >= 0).Select(s => s.TtftAnyMs).ToList();
         var ttft = ttfts.Count > 0 ? Stats.Median(ttfts) : -1;
 
@@ -463,7 +479,7 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
         ]);
     }
 
-    Console.WriteLine($"A kolu — input DEĞİŞKEN, output sabit ({aOutTokens} token tavanı), temperature={aTemp}:");
+    Console.WriteLine($"Arm A — input VARIES, output fixed ({aOutTokens} token ceiling), temperature={aTemp}:");
     Console.WriteLine($"{"in_tok",8} {"out_tok",8} {"out±",8} {"ttftAny",10} {"total_p50",10} {"total_p95",10}");
     Console.WriteLine(new string('-', 60));
 
@@ -472,10 +488,11 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
         var samples = new List<StreamResult>();
         for (var i = 0; i < reps; i++)
         {
-            // Benzersiz prefix: KV cache hit'ini KIRIYORUZ.
-            // Kırmazsak ikinci çağrıdan itibaren prefill atlanır ve sahte bir
-            // hızlanma ölçeriz. Cache etkisini Deney 4'te BİLEREK ölçüyoruz.
-            var prompt = $"[{Guid.NewGuid():N}] " + Filler(size) + "\nBu metni tek kelimeyle özetle.";
+            // Unique prefix: we BREAK the KV cache hit on purpose.
+            // Without it, prefill is skipped from the second call onward and we
+            // would measure a fake speed-up. The cache effect is measured
+            // DELIBERATELY in Experiment 4.
+            var prompt = $"[{Guid.NewGuid():N}] " + Filler(size) + "\nSummarize this text in a single word.";
             samples.Add(await client.ChatStreamAsync(
                 [new Message("user", prompt)], aOutTokens, aTemp, disableThinking: true));
         }
@@ -493,7 +510,7 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
         AddRow("A_prefill", aTemp, samples, inTok, outTok);
     }
 
-    Console.WriteLine($"\nB kolu — input sabit (kısa), output DEĞİŞKEN, temperature={bTemp}:");
+    Console.WriteLine($"\nArm B — input fixed (short), output VARIES, temperature={bTemp}:");
     Console.WriteLine($"{"in_tok",8} {"out_tok",8} {"ttftAny",10} {"total_p50",10} {"tok/s",10}");
     Console.WriteLine(new string('-', 50));
 
@@ -502,7 +519,7 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
         var samples = new List<StreamResult>();
         for (var i = 0; i < reps; i++)
         {
-            var prompt = $"[{Guid.NewGuid():N}] Şantiye güvenliği hakkında uzun bir metin yaz.";
+            var prompt = $"[{Guid.NewGuid():N}] Write a long text about construction site safety.";
             samples.Add(await client.ChatStreamAsync(
                 [new Message("user", prompt)], size, bTemp, disableThinking: true));
         }
@@ -513,7 +530,8 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
         var outTok = samples.Average(s => (double)s.CompletionTokens);
         var inTok = samples.Average(s => (double)s.PromptTokens);
 
-        // Bölme koruması: ttft ile total çakışırsa (v1'deki hata) sonsuz yazma.
+        // Division guard: if ttft coincides with total (the v1 bug) this would
+        // print infinity.
         var span = ttft >= 0 ? p50 - ttft : -1;
         var tpsText = span > 1.0 ? $"{outTok / (span / 1000.0):F1}" : "n/a";
 
@@ -522,18 +540,19 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
         AddRow("B_decode", bTemp, samples, inTok, outTok);
     }
 
-    // --- Katsayı çıkarımı ---
-    // b (decode): B kolunda total'i output_tokens'a regresyon et.
-    // a (prefill): A kolunda input_tokens'a regresyon et — İKİ kez.
+    // --- Coefficient extraction ---
+    // b (decode): regress total on output_tokens in arm B.
+    // a (prefill): regress on input_tokens in arm A — TWICE.
     //
-    //   a_total : total_p50 üzerinden (eski davranış, karşılaştırılabilirlik için)
-    //   a_ttft  : ttft_any_p50 üzerinden (temiz ölçüm)
+    //   a_total : from total_p50 (the old behaviour, kept for comparability)
+    //   a_ttft  : from ttft_any_p50 (the clean measurement)
     //
-    // İkisi neden farklı: A kolunda max_tokens bir TAVAN, sabit değil. Çıktı
-    // uzunluğu input ile birlikte oynarsa decode terimi total'e dayalı eğime
-    // sızar (atlanmış-değişken sapması). ttftAny prefill'in bittiği anı damgalar
-    // ve decode'dan tamamen bağımsızdır — prefill katsayısının doğru ölçüm aracı
-    // budur. Farkın büyük olması çıktı uzunluğunun sabit olmadığını gösterir.
+    // Why they differ: in arm A max_tokens is a CEILING, not a fixed value. If
+    // the output length moves with the input, the decode term leaks into the
+    // total-based slope (omitted-variable bias). ttftAny stamps the moment
+    // prefill finishes and is completely independent of decode — it is the
+    // right instrument for the prefill coefficient. A large gap between the two
+    // means the output length was not constant.
 
     var aRows = rows.Where(r => r[2] == "A_prefill").ToList();
     var bRows = rows.Where(r => r[2] == "B_decode").ToList();
@@ -556,8 +575,8 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
     var (aTtft, aTtftIntercept) = Stats.LinearFit(aTtftX, aTtftY);
     var aTtftR2 = Stats.RSquared(aTtftX, aTtftY, aTtft, aTtftIntercept);
 
-    // Prefill katsayısı olarak ttft'ye dayalı olanı kullanıyoruz; ölçülemediyse
-    // (hiç ttft yoksa) eskisine düşüyoruz ve bunu açıkça söylüyoruz.
+    // We use the ttft-based value as the prefill coefficient; if it could not be
+    // measured (no ttft at all) we fall back to the old one and say so plainly.
     var aFromTtft = aTtftX.Length >= 2 && aTtft > 0;
     var a = aFromTtft ? aTtft : aTotal;
 
@@ -566,54 +585,54 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
     var ratio = a > 1e-9 ? b / a : double.NaN;
 
     Console.WriteLine(new string('-', 60));
-    Console.WriteLine($"Prefill (a) : {a:F4} ms / input token   [{(aFromTtft ? "ttft tabanlı" : "total tabanlı — ttft yok")}]");
+    Console.WriteLine($"Prefill (a) : {a:F4} ms / input token   [{(aFromTtft ? "ttft based" : "total based — no ttft")}]");
     Console.WriteLine($"   a_ttft   : {aTtft:F4}  (R²={aTtftR2:F3}, n={aTtftX.Length})");
-    Console.WriteLine($"   a_total  : {aTotal:F4}  (R²={aTotalR2:F3}, n={aX.Length})  <- eski yöntem");
+    Console.WriteLine($"   a_total  : {aTotal:F4}  (R²={aTotalR2:F3}, n={aX.Length})  <- old method");
     Console.WriteLine($"Decode  (b) : {b:F3} ms / output token   (~{(b > 0 ? 1000 / b : 0):F1} tok/s, R²={bR2:F3})");
-    Console.WriteLine($"Sabit   (c) : {pureOverhead:F0} ms   (B kolu kesişimi: {bIntercept:F0} ms)");
+    Console.WriteLine($"Constant (c): {pureOverhead:F0} ms   (arm B intercept: {bIntercept:F0} ms)");
     Console.WriteLine();
 
-    // Sessiz saçmalama koruması. Eskiden a<=0 iken CSV'ye "oran = 0" yazılıyordu
-    // ve bu, ölçülmüş bir sonuç gibi okunuyordu.
+    // Guard against silent nonsense. It used to write "ratio = 0" to the CSV
+    // when a<=0, and that read like a measured result.
     var suspect = new List<string>();
-    if (a <= 1e-9) suspect.Add($"prefill katsayısı pozitif değil (a={a:F5})");
-    if (b <= 1e-9) suspect.Add($"decode katsayısı pozitif değil (b={b:F5})");
-    if (pureOverhead < 0) suspect.Add($"sabit overhead negatif ({pureOverhead:F0} ms) — b farklı bir rejimden ödünç alınıyor");
-    if (aTtftR2 < 0.9 && aTtftX.Length >= 2) suspect.Add($"prefill uyumu zayıf (R²={aTtftR2:F3})");
-    if (bR2 < 0.9) suspect.Add($"decode uyumu zayıf (R²={bR2:F3})");
+    if (a <= 1e-9) suspect.Add($"prefill coefficient is not positive (a={a:F5})");
+    if (b <= 1e-9) suspect.Add($"decode coefficient is not positive (b={b:F5})");
+    if (pureOverhead < 0) suspect.Add($"constant overhead is negative ({pureOverhead:F0} ms) — b is borrowed from a different regime");
+    if (aTtftR2 < 0.9 && aTtftX.Length >= 2) suspect.Add($"weak prefill fit (R²={aTtftR2:F3})");
+    if (bR2 < 0.9) suspect.Add($"weak decode fit (R²={bR2:F3})");
     if (Math.Abs(aTotal - aTtft) > 0.5 * Math.Max(aTtft, 1e-9) && aFromTtft)
-        suspect.Add("a_total ile a_ttft %50'den fazla ayrışıyor — A kolunda çıktı uzunluğu sabit değil");
+        suspect.Add("a_total and a_ttft diverge by more than 50% — output length is not constant in arm A");
 
     if (double.IsNaN(ratio))
-        Console.WriteLine(">>> out/in maliyet oranı HESAPLANAMADI (a <= 0) <<<");
+        Console.WriteLine(">>> out/in cost ratio COULD NOT BE COMPUTED (a <= 0) <<<");
     else
-        Console.WriteLine($">>> 1 output token ≈ {ratio:F0} input token maliyeti <<<");
+        Console.WriteLine($">>> 1 output token ~= the cost of {ratio:F0} input tokens <<<");
 
     if (suspect.Count > 0)
     {
         Console.WriteLine();
-        Console.WriteLine("UYARI — katsayılar şüpheli, olduğu gibi rapora taşıma:");
+        Console.WriteLine("WARNING — the coefficients are suspect, do not carry them into a report as-is:");
         foreach (var s in suspect) Console.WriteLine($"  - {s}");
     }
 
     Console.WriteLine();
-    Console.WriteLine("Sonuç: prompt uzunluğu ucuz, cevap uzunluğu pahalı.");
-    Console.WriteLine("RAG'de top-k'yı cömert tut; 'kısa cevap ver' bir performans kararıdır.");
+    Console.WriteLine("Conclusion: prompt length is cheap, answer length is expensive.");
+    Console.WriteLine("Be generous with top-k in RAG; 'answer briefly' is a performance decision.");
 
     Csv.Write(config, "02_prefill_decode",
-        ["run_id", "model", "kol", "input_tokens", "output_tokens",
+        ["run_id", "model", "arm", "input_tokens", "output_tokens",
          "ttft_any_p50_ms", "total_p50_ms", "total_p95_ms",
-         "temperature", "n_ornek", "n_ttft_olculen",
-         "out_tok_min", "out_tok_max", "tahmini_out_token_sayisi", "max_tokens_kesilen"],
+         "temperature", "n_samples", "n_ttft_measured",
+         "out_tok_min", "out_tok_max", "estimated_out_token_count", "max_tokens_truncated"],
         rows);
 
-    Csv.Write(config, "02_katsayilar",
-        ["run_id", "model", "prefill_ms_per_in_token", "prefill_kaynak",
+    Csv.Write(config, "02_coefficients",
+        ["run_id", "model", "prefill_ms_per_in_token", "prefill_source",
          "prefill_ttft_ms_per_in_token", "prefill_ttft_r2",
          "prefill_total_ms_per_in_token", "prefill_total_r2",
          "decode_ms_per_out_token", "decode_r2", "tok_per_sec",
-         "sabit_overhead_ms", "b_kolu_kesisim_ms", "out_in_maliyet_orani",
-         "n_ornek_per_nokta", "a_kolu_temperature", "b_kolu_temperature", "uyarilar"],
+         "constant_overhead_ms", "b_arm_intercept_ms", "out_in_cost_ratio",
+         "n_samples_per_point", "a_arm_temperature", "b_arm_temperature", "warnings"],
         [[runId, client.ModelId,
           Inv(a, "F5"), aFromTtft ? "ttft" : "total",
           Inv(aTtft, "F5"), Inv(aTtftR2, "F4"),
@@ -627,39 +646,39 @@ static async Task Experiment2_PrefillDecode(LmClient client, Config config, stri
 
 
 // ============================================================================
-// DENEY 3 — Determinizm
+// EXPERIMENT 3 — Determinism
 //
-// Gemini'de 10/10 farklı çıktı almıştın. Bundan "LLM non-deterministiktir"
-// sonucu çıkarmak YANLIŞ olurdu. Model ağırlıkları sabit bir fonksiyondur;
-// non-determinism iki yerden gelir:
+// On Gemini you got 10/10 different outputs. Concluding "LLMs are
+// non-deterministic" from that would be WRONG. Model weights are a fixed
+// function; non-determinism comes from two places:
 //   1. sampling (temperature > 0)
-//   2. sunucu tarafı batching / GPU floating-point toplama sırası
+//   2. server-side batching / GPU floating-point summation order
 //
-// v1 hatası: tüm çıktılar boş string'di; "1/20 benzersiz" sonucu 20 adet boş
-// string'in eşitliğiydi. v2 reasoning kanalını da okuyor ve boş çıktıyı açıkça
-// hata olarak raporluyor.
+// v1 bug: every output was the empty string; the "1/20 unique" result was the
+// equality of 20 empty strings. v2 also reads the reasoning channel and
+// reports empty output explicitly as an error.
 //
-// temp=1.8 kolu bir KONTROL kolu: parametrenin modele ulaştığını doğruluyor.
-// Orada bile çeşitlilik yoksa temperature uygulanmıyor demektir.
+// The temp=1.8 arm is a CONTROL arm: it verifies that the parameter reaches the
+// model. If there is no variety even there, temperature is not being applied.
 // ============================================================================
 static async Task Experiment3_Determinism(LmClient client, Config config, string runId)
 {
-    Header("DENEY 3 — Determinizm (4 kol)");
+    Header("EXPERIMENT 3 — Determinism (4 arms)");
 
     const int n = 20;
     const string prompt =
-        "Bir hakediş raporunda mutlaka bulunması gereken üç unsuru say. Kısa yaz.";
+        "List three elements that must be present in a progress payment report. Keep it short.";
 
     var arms = new (string Name, double Temp, int? Seed)[]
     {
-        ("temp0_seed_sabit", 0.0, 42),
-        ("temp0_seed_yok",   0.0, null),
-        ("temp08_seed_yok",  0.8, null),
-        ("temp18_seed_yok",  1.8, null),   // kontrol kolu
+        ("temp0_seed_fixed", 0.0, 42),
+        ("temp0_seed_none",  0.0, null),
+        ("temp08_seed_none", 0.8, null),
+        ("temp18_seed_none", 1.8, null),   // control arm
     };
 
     var rows = new List<string[]>();
-    Console.WriteLine($"{"kol",-20} {"benzersiz",12} {"bos_haric",11} {"ilk_ile_ayni",13} {"ort_kar",9} {"bos",5}");
+    Console.WriteLine($"{"arm",-20} {"unique",12} {"excl_empty",11} {"same_as_first",13} {"avg_chars",9} {"empty",5}");
     Console.WriteLine(new string('-', 74));
 
     foreach (var (name, temp, seed) in arms)
@@ -677,16 +696,18 @@ static async Task Experiment3_Determinism(LmClient client, Config config, string
         var emptyCount = outputs.Count(string.IsNullOrEmpty);
         var distinct = outputs.Distinct().Count();
 
-        // Boş çıktılar da "benzersiz" sayılıyordu: temp=1.8 kolundaki 20/20'nin
-        // bir birimi tek bir boş string'di. Boş hariç sayımı ayrı raporluyoruz.
+        // Empty outputs were counted as "unique" too: one unit of the 20/20 in
+        // the temp=1.8 arm was a single empty string. We report the count
+        // excluding empties separately.
         var distinctNonEmpty = nonEmpty.Distinct().Count();
         var samePct = 100.0 * outputs.Count(o => o == outputs[0]) / n;
         var avgLen = outputs.Average(o => o.Length);
         var avgLenNonEmpty = nonEmpty.Count > 0 ? nonEmpty.Average(o => o.Length) : 0;
 
-        // v1'in hatası reasoning'i hiç okumamaktı; Deney 3 hâlâ yalnızca Text'i
-        // saklayıp reasoning'i, token sayılarını ve süreyi atıyordu — yani boş
-        // çıktının sebebi (bütçe reasoning'e mi gitti?) veriden görülemiyordu.
+        // v1's bug was never reading reasoning at all; Experiment 3 still only
+        // kept Text and threw away reasoning, the token counts and the timing —
+        // so the reason for an empty output (did the budget go to reasoning?)
+        // was invisible in the data.
         var avgReasoningChars = results.Average(r => (double)r.Reasoning.Length);
         var avgCompletionTok = results.Average(r => (double)r.CompletionTokens);
         var avgReasoningTok = results.Average(r => (double)r.ReasoningTokens);
@@ -696,13 +717,13 @@ static async Task Experiment3_Determinism(LmClient client, Config config, string
                           $"{samePct,12:F0}% {avgLen,9:F0} {emptyCount,5}");
 
         if (emptyCount > 0)
-            Console.WriteLine($"  UYARI: {emptyCount}/{n} çıktı BOŞ " +
-                              $"(ort. reasoning {avgReasoningChars:F0} kar / {avgReasoningTok:F0} token — " +
-                              "bütçe düşünmeye gitmiş olabilir).");
+            Console.WriteLine($"  WARNING: {emptyCount}/{n} outputs were EMPTY " +
+                              $"(avg. reasoning {avgReasoningChars:F0} chars / {avgReasoningTok:F0} tokens — " +
+                              "the budget may have gone to thinking).");
 
         if (truncated > 0)
-            Console.WriteLine($"  UYARI: {truncated}/{n} çıktı max_tokens tavanında kesildi — " +
-                              "çeşitlilik sayımı kesik metinleri karşılaştırıyor.");
+            Console.WriteLine($"  WARNING: {truncated}/{n} outputs were cut at the max_tokens ceiling — " +
+                              "the variety count is comparing truncated texts.");
 
         rows.Add([runId, client.ModelId, name,
                   Inv(temp, "F1"), seed?.ToString() ?? "",
@@ -712,88 +733,91 @@ static async Task Experiment3_Determinism(LmClient client, Config config, string
                   Inv(avgReasoningChars, "F0"), Inv(avgCompletionTok, "F0"),
                   Inv(avgReasoningTok, "F0"), truncated.ToString()]);
 
-        // 20 çıktının 17'si diske hiç ulaşmıyordu; Levenshtein/self-BLEU gibi
-        // dereceli çeşitlilik metrikleri sonradan hesaplanamıyordu. Hepsini yaz.
+        // 17 of the 20 outputs never reached disk; graded variety metrics such
+        // as Levenshtein or self-BLEU could not be computed after the fact.
+        // Write all of them.
         var dump = new StringBuilder();
-        dump.AppendLine($"# {name} — temp={temp}, seed={(seed?.ToString() ?? "yok")}, n={n} — {runId}");
+        dump.AppendLine($"# {name} — temp={temp}, seed={(seed?.ToString() ?? "none")}, n={n} — {runId}");
         for (var i = 0; i < results.Count; i++)
         {
             dump.AppendLine();
-            dump.AppendLine($"----- çıktı {i + 1}/{n} " +
-                            $"(content {outputs[i].Length} kar, reasoning {results[i].Reasoning.Length} kar, " +
+            dump.AppendLine($"----- output {i + 1}/{n} " +
+                            $"(content {outputs[i].Length} chars, reasoning {results[i].Reasoning.Length} chars, " +
                             $"finish={results[i].FinishReason}) -----");
             dump.AppendLine();
-            dump.AppendLine(outputs[i].Length == 0 ? "(boş)" : outputs[i]);
+            dump.AppendLine(outputs[i].Length == 0 ? "(empty)" : outputs[i]);
         }
 
-        WriteTextOutput(config, $"03_ornek_{name}.txt", dump.ToString(), runId);
+        WriteTextOutput(config, $"03_sample_{name}.txt", dump.ToString(), runId);
     }
 
     Console.WriteLine(new string('-', 74));
-    Console.WriteLine("Beklenti: temp=0 -> 1/20 benzersiz (deterministik).");
-    Console.WriteLine("          temp=1.8 -> yüksek çeşitlilik. DEĞİLSE temperature modele");
-    Console.WriteLine("          ulaşmıyor (LM Studio 'Default Parameters' eziyor olabilir).");
+    Console.WriteLine("Expectation: temp=0 -> 1/20 unique (deterministic).");
+    Console.WriteLine("             temp=1.8 -> high variety. IF NOT, temperature is not reaching");
+    Console.WriteLine("             the model (LM Studio 'Default Parameters' may be overriding it).");
     Console.WriteLine();
-    Console.WriteLine("SINIR: çağrılar sıralı — aynı anda tek istek uçuyor. Sunucu tarafı");
-    Console.WriteLine("       batching kaynaklı non-determinizm bu tasarımla ÖLÇÜLEMEZ.");
-    Console.WriteLine("SINIR: 'benzersiz' tam string eşitliği; n'de doyar. temp=0.8 ile 1.8'i");
-    Console.WriteLine("       ayırt edemez, bu yüzden kontrol kolu zayıf bir sinyaldir.");
+    Console.WriteLine("LIMIT: the calls are sequential — only one request is in flight at a time.");
+    Console.WriteLine("       Non-determinism caused by server-side batching CANNOT be measured");
+    Console.WriteLine("       with this design.");
+    Console.WriteLine("LIMIT: 'unique' is exact string equality and saturates at n. It cannot tell");
+    Console.WriteLine("       temp=0.8 from 1.8, which makes the control arm a weak signal.");
 
-    Csv.Write(config, "03_determinizm",
-        ["run_id", "model", "kol", "temperature", "seed", "n",
-         "benzersiz_cikti", "ilk_ile_ayni_yuzde", "ort_karakter", "bos_cikti_sayisi",
-         "benzersiz_bos_haric", "ort_karakter_bos_haric",
-         "ort_reasoning_karakter", "ort_completion_token", "ort_reasoning_token",
-         "max_tokens_kesilen"],
+    Csv.Write(config, "03_determinism",
+        ["run_id", "model", "arm", "temperature", "seed", "n",
+         "unique_outputs", "same_as_first_pct", "avg_chars", "empty_output_count",
+         "unique_excl_empty", "avg_chars_excl_empty",
+         "avg_reasoning_chars", "avg_completion_tokens", "avg_reasoning_tokens",
+         "max_tokens_truncated"],
         rows);
 }
 
 
 // ============================================================================
-// DENEY 4 — Statelessness + KV cache (uzun context)
+// EXPERIMENT 4 — Statelessness + KV cache (long context)
 //
-// İki ayrı gerçek var, karıştırma:
+// There are two separate truths here, do not conflate them:
 //
-// (a) Protokol seviyesinde: her tur tüm geçmişi yeniden gönderirsin.
-//     Token maliyeti kuadratik birikir. Bu değişmez.
+// (a) At the protocol level: every turn you resend the whole history.
+//     Token cost accumulates quadratically. That does not change.
 //
-// (b) Sunucu seviyesinde: aynı prefix'le devam eden istekte prefill yeniden
-//     HESAPLANMAZ, KV cache'ten gelir.
+// (b) At the server level: for a request continuing with the same prefix,
+//     prefill is NOT RECOMPUTED, it comes from the KV cache.
 //
-// v1 hatası: prompt'lar 42-162 token'dı. Prefill katsayısı ~0.19 ms olduğuna
-// göre cache'in kurtarabileceği maksimum süre ~30 ms — 1400 ms'lik toplamın
-// içinde görünmez. Deney gürültü ölçtü.
+// v1 bug: the prompts were 42-162 tokens. With a prefill coefficient of ~0.19
+// ms, the most the cache could save is ~30 ms — invisible inside a 1400 ms
+// total. The experiment measured noise.
 //
-// v2: system mesajına uzun bir doküman koyuyoruz. Artık prefill baskın
-// rejimdeyiz ve cache etkisi sinyal veriyor.
+// v2: we put a long document into the system message. We are now in the
+// prefill-dominated regime and the cache effect produces a signal.
 //
-// Mimari sonuç: sabit içerik (system prompt + sözleşme metni) BAŞTA, değişken
-// içerik (kullanıcı sorusu) SONDA. Sıralamayı bozmak performans hatasıdır.
+// Architectural consequence: fixed content (system prompt + contract text)
+// FIRST, variable content (the user's question) LAST. Breaking that order is a
+// performance bug.
 // ============================================================================
 static async Task Experiment4_KvCache(LmClient client, Config config, string runId)
 {
-    Header($"DENEY 4 — KV cache (uzun context: ~{config.DocWords} kelime)");
+    Header($"EXPERIMENT 4 — KV cache (long context: ~{config.DocWords} words)");
 
     var document = Filler(config.DocWords);
 
     var turns = new[]
     {
-        "Bu dokümana göre hakediş nedir? Kısa açıkla.",
-        "Geçici hakediş ile kesin hakediş farkı nedir?",
-        "Fiyat farkı bu hesaba nasıl giriyor?",
-        "İş artışı olursa ne değişir?",
-        "Bunları üç maddede özetle.",
+        "According to this document, what is a progress payment? Explain briefly.",
+        "What is the difference between an interim and a final progress payment?",
+        "How does the price difference enter this calculation?",
+        "What changes if there is a work increase?",
+        "Summarize all of this in three bullet points.",
     };
 
     var rows = new List<string[]>();
-    var systemBase = "Aşağıdaki sözleşme dokümanına göre cevap ver.\n\n" + document;
+    var systemBase = "Answer according to the contract document below.\n\n" + document;
     var emptyAssistantTurns = 0;
 
     foreach (var cacheFriendly in new[] { true, false })
     {
-        var mode = cacheFriendly ? "cache_dostu" : "cache_dusmani";
+        var mode = cacheFriendly ? "cache_friendly" : "cache_hostile";
         Console.WriteLine($"\n{mode}:");
-        Console.WriteLine($"{"tur",4} {"prompt_tok",12} {"kumulatif",12} {"cevap_kar",10} {"ttftAny",10} {"total",10}");
+        Console.WriteLine($"{"turn",4} {"prompt_tok",12} {"cumulative",12} {"answer_chr",10} {"ttftAny",10} {"total",10}");
         Console.WriteLine(new string('-', 62));
 
         var history = new List<Message> { new("system", systemBase) };
@@ -802,9 +826,10 @@ static async Task Experiment4_KvCache(LmClient client, Config config, string run
 
         for (var t = 0; t < turns.Length; t++)
         {
-            // Cache düşmanı kol: her turda system mesajının BAŞINA benzersiz bir
-            // değer koyuyoruz. Tek karakter bile değişse prefix eşleşmesi bozulur
-            // ve tüm prefill baştan hesaplanır. Ölçtüğümüz fark tam olarak bu.
+            // Cache-hostile arm: on every turn we put a unique value at the
+            // FRONT of the system message. Changing even a single character
+            // breaks the prefix match and the whole prefill is recomputed. The
+            // difference we measure is exactly that.
             history[0] = cacheFriendly
                 ? new Message("system", systemBase)
                 : new Message("system", $"[{Guid.NewGuid():N}]\n" + systemBase);
@@ -813,13 +838,14 @@ static async Task Experiment4_KvCache(LmClient client, Config config, string run
 
             var r = await client.ChatStreamAsync(history, 150, 0, disableThinking: true);
 
-            // Model yalnızca reasoning ürettiyse content boş gelir. Geçmişe
-            // reasoning YAZMIYORUZ (model kendi düşüncesini geri okumaz), ama
-            // "(bos)" yazıp sessizce geçmek de yanlıştı: CSV, 150 token'lık bir
-            // cevap eklenmiş gibi okunuyordu. Gerçeği ayrı bir kolona yazıyoruz.
+            // If the model produced only reasoning, content comes back empty. We
+            // do NOT write reasoning into the history (a model does not read its
+            // own thoughts back), but silently writing "(empty)" was wrong too:
+            // the CSV then read as though a 150-token answer had been appended.
+            // We record the truth in a separate column.
             var answer = r.Text.Trim();
             if (answer.Length == 0) emptyAssistantTurns++;
-            history.Add(new Message("assistant", answer.Length == 0 ? "(cevap yok)" : answer));
+            history.Add(new Message("assistant", answer.Length == 0 ? "(no answer)" : answer));
 
             cumulativePrompt += r.PromptTokens;
             cumulativeTotal += r.PromptTokens + r.CompletionTokens;
@@ -836,88 +862,92 @@ static async Task Experiment4_KvCache(LmClient client, Config config, string run
         }
     }
 
-    // Tur 1 hariç: ilk turda iki kol da soğuk, karşılaştırma anlamsız.
-    // Filtre pozisyonel Skip(1) değil, tur kolonu üzerinden: döngü sırası
-    // değişirse Skip(1) sessizce yanlış satırı atardı.
-    // Ölçülemeyen ttft (-1) ortalamaya girmiyor.
+    // Turn 1 excluded: on the first turn both arms are cold, the comparison is
+    // meaningless. The filter is on the turn column rather than a positional
+    // Skip(1): if the loop order changed, Skip(1) would silently drop the wrong
+    // row. An unmeasured ttft (-1) does not enter the average.
     static double[] Ttfts(List<string[]> src, string mode) => src
         .Where(r => r[2] == mode && r[3] != "1")
         .Select(r => double.Parse(r[7], CultureInfo.InvariantCulture))
         .Where(v => v >= 0)
         .ToArray();
 
-    var dostuVals = Ttfts(rows, "cache_dostu");
-    var dusmanVals = Ttfts(rows, "cache_dusmani");
+    var friendlyVals = Ttfts(rows, "cache_friendly");
+    var hostileVals = Ttfts(rows, "cache_hostile");
 
-    if (dostuVals.Length == 0 || dusmanVals.Length == 0)
+    if (friendlyVals.Length == 0 || hostileVals.Length == 0)
     {
         Console.WriteLine(new string('-', 62));
-        Console.WriteLine("UYARI: karşılaştırma için yeterli ttft ölçümü yok, özet atlanıyor.");
+        Console.WriteLine("WARNING: not enough ttft measurements for the comparison, skipping the summary.");
     }
     else
     {
-        // Medyan — modülün kendi kuralı bu (bkz. Stats bloğu). Burada Average
-        // kullanılıyordu ve tek bir termal spike manşet sayıyı bozabiliyordu.
-        var dostu = Stats.Median(dostuVals);
-        var dusman = Stats.Median(dusmanVals);
+        // Median — that is this module's own rule (see the Stats block). Average
+        // was used here, and a single thermal spike could distort the headline
+        // number.
+        var friendly = Stats.Median(friendlyVals);
+        var hostile = Stats.Median(hostileVals);
 
-        // Ham fark yanıltıcı olabilir: cache_dusmani kolunun prompt'u GUID
-        // yüzünden birkaç token daha uzun. Token başına normalize edip de veriyoruz.
-        var dostuTok = rows.Where(r => r[2] == "cache_dostu" && r[3] != "1")
-                           .Average(r => double.Parse(r[4], CultureInfo.InvariantCulture));
-        var dusmanTok = rows.Where(r => r[2] == "cache_dusmani" && r[3] != "1")
-                            .Average(r => double.Parse(r[4], CultureInfo.InvariantCulture));
+        // The raw difference can mislead: the cache_hostile arm's prompt is a few
+        // tokens longer because of the GUID. We also give the per-token normalized
+        // figure.
+        var friendlyTok = rows.Where(r => r[2] == "cache_friendly" && r[3] != "1")
+                              .Average(r => double.Parse(r[4], CultureInfo.InvariantCulture));
+        var hostileTok = rows.Where(r => r[2] == "cache_hostile" && r[3] != "1")
+                             .Average(r => double.Parse(r[4], CultureInfo.InvariantCulture));
 
         Console.WriteLine(new string('-', 62));
-        Console.WriteLine($"Medyan ttftAny (tur 2-5): cache_dostu {dostu:F0} ms | cache_dusmani {dusman:F0} ms");
-        Console.WriteLine($"Cache kazancı: {dusman - dostu:F0} ms  (%{100 * (dusman - dostu) / Math.Max(dusman, 1):F0})");
-        Console.WriteLine($"Prompt boyutu (tur 2-5 ort.): dostu {dostuTok:F0} tok | dusmani {dusmanTok:F0} tok");
-        Console.WriteLine($"Token başına prefill: dostu {dostu / Math.Max(dostuTok, 1):F4} ms | " +
-                          $"dusmani {dusman / Math.Max(dusmanTok, 1):F4} ms/token");
+        Console.WriteLine($"Median ttftAny (turns 2-5): cache_friendly {friendly:F0} ms | cache_hostile {hostile:F0} ms");
+        Console.WriteLine($"Cache saving: {hostile - friendly:F0} ms  ({100 * (hostile - friendly) / Math.Max(hostile, 1):F0}%)");
+        Console.WriteLine($"Prompt size (turns 2-5 avg.): friendly {friendlyTok:F0} tok | hostile {hostileTok:F0} tok");
+        Console.WriteLine($"Prefill per token: friendly {friendly / Math.Max(friendlyTok, 1):F4} ms | " +
+                          $"hostile {hostile / Math.Max(hostileTok, 1):F4} ms/token");
         Console.WriteLine();
-        Console.WriteLine("prompt_tokens iki kolda da benzer artar (protokol gerçeği değişmez),");
-        Console.WriteLine("ama ttft cache_dostu kolda düşük kalır (sunucu optimizasyonu).");
+        Console.WriteLine("prompt_tokens grows similarly in both arms (the protocol truth does not change),");
+        Console.WriteLine("but ttft stays low in the cache_friendly arm (a server-side optimization).");
     }
 
     if (emptyAssistantTurns > 0)
     {
         Console.WriteLine();
-        Console.WriteLine($"UYARI: {emptyAssistantTurns} turda asistan cevabı BOŞ geldi ve geçmişe");
-        Console.WriteLine("       '(cevap yok)' olarak eklendi. Yani bu bir 5 turluk GERÇEK konuşma");
-        Console.WriteLine("       değil; completion_tokens kolonu cevabın geçmişe girdiğini göstermez.");
-        Console.WriteLine("       KV cache karşılaştırması geçerli, konuşma anlatısı değil.");
+        Console.WriteLine($"WARNING: the assistant answer came back EMPTY on {emptyAssistantTurns} turns and was");
+        Console.WriteLine("         appended to the history as '(no answer)'. So this is not a REAL five-turn");
+        Console.WriteLine("         conversation; the completion_tokens column does not show that the answer");
+        Console.WriteLine("         entered the history. The KV cache comparison is still valid, the");
+        Console.WriteLine("         conversational narrative is not.");
     }
 
     Csv.Write(config, "04_kv_cache",
-        ["run_id", "model", "mod", "tur", "prompt_tokens", "kumulatif_prompt_tokens",
+        ["run_id", "model", "mode", "turn", "prompt_tokens", "cumulative_prompt_tokens",
          "completion_tokens", "ttft_any_ms", "total_ms",
-         "kumulatif_toplam_tokens", "asistan_cevap_karakter", "reasoning_karakter", "finish_reason"],
+         "cumulative_total_tokens", "assistant_answer_chars", "reasoning_chars", "finish_reason"],
         rows);
 }
 
 
 // ============================================================================
-// DENEY 5 — Eşzamanlılık ve throughput
+// EXPERIMENT 5 — Concurrency and throughput
 //
-// Gemini'de sınır rate limit'ti (burst 429 vs daily quota 429). Lokalde 429 yok;
-// sınır GPU'nun kendisi. Ölçtüğümüz şey değişti:
+// On Gemini the limit was the rate limit (burst 429 vs daily quota 429).
+// Locally there is no 429; the limit is the GPU itself. What we measure has
+// changed:
 //
-//   - toplam throughput (tok/s): bir yere kadar ARTAR, sonra doyar
-//   - istek başına latency: BAŞTAN İTİBAREN bozulur
+//   - aggregate throughput (tok/s): RISES up to a point, then saturates
+//   - per-request latency: degrades FROM THE VERY START
 //
-// İkisi aynı anda doğrudur. Klasik throughput-latency trade-off'u.
+// Both are true at the same time. The classic throughput-latency trade-off.
 //
-// Neden önemli: "tek GPU'lu lokal kurulum kaç eşzamanlı kullanıcı kaldırır"
-// sorusunun cevabı. Kapasite planlaması bu eğriden çıkar.
+// Why it matters: it answers "how many concurrent users can a single-GPU local
+// setup carry". Capacity planning comes out of this curve.
 // ============================================================================
 static async Task Experiment5_Concurrency(LmClient client, Config config, string runId)
 {
-    Header("DENEY 5 — Eşzamanlılık / throughput");
+    Header("EXPERIMENT 5 — Concurrency / throughput");
 
     var levels = new[] { 1, 2, 4, 8, 16, 32 };
     var rows = new List<string[]>();
 
-    Console.WriteLine($"{"paralel",8} {"basarili",9} {"toplam tok/s",14} {"p50 lat",10} {"p95 lat",10} {"istek/s",10} {"hata",6}");
+    Console.WriteLine($"{"parallel",8} {"ok",9} {"total tok/s",14} {"p50 lat",10} {"p95 lat",10} {"req/s",10} {"errors",6}");
     Console.WriteLine(new string('-', 72));
 
     foreach (var level in levels)
@@ -928,10 +958,10 @@ static async Task Experiment5_Concurrency(LmClient client, Config config, string
 
         var tasks = Enumerable.Range(0, level).Select(async _ =>
         {
-            // Benzersiz prefix: paralel isteklerin birbirinin cache'inden
-            // faydalanmasını engelliyoruz. Yoksa yüksek paralellikte sahte bir
-            // throughput artışı ölçeriz.
-            var prompt = $"[{Guid.NewGuid():N}] Şantiye iş güvenliği önlemlerini açıkla.";
+            // Unique prefix: we stop parallel requests from benefiting from each
+            // other's cache. Otherwise we would measure a fake throughput rise at
+            // high concurrency.
+            var prompt = $"[{Guid.NewGuid():N}] Explain construction site occupational safety measures.";
             try
             {
                 return await client.ChatStreamAsync(
@@ -939,11 +969,12 @@ static async Task Experiment5_Concurrency(LmClient client, Config config, string
             }
             catch (Exception ex)
             {
-                // Hata TÜRÜ kalıcı veriye geçsin: 429 / timeout / bağlantı kopması
-                // / 500 ayrımı yapılamadığında sınırın istemcide mi sunucuda mı
-                // olduğu sonradan hiç bilinemiyordu.
+                // Let the error KIND make it into the persisted data: without
+                // distinguishing 429 / timeout / dropped connection / 500 there
+                // was no way to tell afterwards whether the limit was on the
+                // client or the server.
                 lock (errorLock) errors.Add(ex.GetType().Name);
-                Console.WriteLine($"  hata ({ex.GetType().Name}): {Trunc(ex.Message, 120)}");
+                Console.WriteLine($"  error ({ex.GetType().Name}): {Trunc(ex.Message, 120)}");
                 return null;
             }
         }).ToArray();
@@ -958,8 +989,8 @@ static async Task Experiment5_Concurrency(LmClient client, Config config, string
 
         if (ok.Length == 0)
         {
-            // Satır YAZILIYOR. Eskiden continue ediliyordu ve CSV'de "tamamen
-            // çöktü" ile "hiç denenmedi" ayırt edilemiyordu.
+            // The row IS written. It used to `continue`, and the CSV could not
+            // distinguish "collapsed completely" from "never attempted".
             Console.WriteLine($"{level,8} {0,9} {"-",14} {"-",10} {"-",10} {"-",10} {failed,6}");
 
             rows.Add([runId, client.ModelId, level.ToString(), "0",
@@ -979,94 +1010,97 @@ static async Task Experiment5_Concurrency(LmClient client, Config config, string
         Console.WriteLine($"{level,8} {ok.Length,9} {aggTps,14:F1} {p50,10:F0} {p95,10:F0} {rps,10:F2} {failed,6}");
 
         if (failed > 0)
-            Console.WriteLine($"  UYARI: duvar saati TÜM istekleri (başarısızlar dahil) kapsıyor, " +
-                              $"throughput {failed} hata yüzünden düşük görünüyor.");
+            Console.WriteLine($"  WARNING: the wall clock covers ALL requests (failures included), " +
+                              $"so throughput looks low because of {failed} errors.");
 
         rows.Add([runId, client.ModelId, level.ToString(), totalOut.ToString(),
                   Inv(wallSec, "F3"), Inv(aggTps, "F2"),
                   Inv(p50, "F1"), Inv(p95, "F1"), Inv(rps, "F3"), failed.ToString(),
                   ok.Length.ToString(), errorKinds, failed > 0 ? "1" : "0"]);
 
-        // GPU'nun toparlanması için ara — termal ve bellek baskısı bir sonraki
-        // seviyeye sızmasın. Ölçüm ortamının kendisi de veridir.
+        // Pause so the GPU can recover — thermal and memory pressure must not
+        // leak into the next level. The measurement environment is data too.
         await Task.Delay(3000);
     }
 
     Console.WriteLine(new string('-', 72));
-    Console.WriteLine("Doyum noktası: toplam tok/s'in artmayı bıraktığı paralellik seviyesi.");
-    Console.WriteLine("Kapasite kararı bu noktadan ÖNCESİ, p95 latency bütçene göre alınır.");
+    Console.WriteLine("Saturation point: the concurrency level at which total tok/s stops rising.");
+    Console.WriteLine("The capacity decision is taken BEFORE that point, against your p95 latency budget.");
     Console.WriteLine();
-    Console.WriteLine("SINIR: p95 burada nearest-rank ile hesaplanıyor ve n <= 20 iken");
-    Console.WriteLine("       matematiksel olarak MAKSİMUM'a eşittir (n = başarılı istek sayısı).");
-    Console.WriteLine("       Yani p50/p95 kuyruk istatistiği değil, tek batch'in en yavaş isteği.");
-    Console.WriteLine("SINIR: seviyeler tek koşu ve daima artan sırada — en yüksek paralellik");
-    Console.WriteLine("       daima en ısınmış GPU'da ölçülüyor. Tekrar/karşı-dengeleme yok.");
-    Console.WriteLine("ÖNCE DOĞRULA: sunucunun Max Concurrent Predictions ayarı test edilen en");
-    Console.WriteLine("       yüksek seviyeden BÜYÜK olmalı; değilse ölçtüğün şey GPU doyumu");
-    Console.WriteLine("       değil, config kuyruğudur ve 'doyum noktası' dairesel bir sonuç olur.");
+    Console.WriteLine("LIMIT: p95 here is computed by nearest-rank and is mathematically EQUAL to the");
+    Console.WriteLine("       MAXIMUM while n <= 20 (n = number of successful requests). So p50/p95 is");
+    Console.WriteLine("       not a tail statistic but the slowest request of a single batch.");
+    Console.WriteLine("LIMIT: the levels are run once and always in increasing order — the highest");
+    Console.WriteLine("       concurrency is always measured on the hottest GPU. No repetition or");
+    Console.WriteLine("       counterbalancing.");
+    Console.WriteLine("VERIFY FIRST: the server's Max Concurrent Predictions setting must be GREATER");
+    Console.WriteLine("       than the highest level tested; otherwise what you measure is not GPU");
+    Console.WriteLine("       saturation but a config queue, and the 'saturation point' is circular.");
 
-    Csv.Write(config, "05_esyamanlilik",
-        ["run_id", "model", "paralellik", "toplam_output_token", "duvar_saati_sn",
-         "toplam_tok_per_sn", "p50_latency_ms", "p95_latency_ms", "istek_per_sn", "hata_sayisi",
-         "basarili_istek", "hata_turleri", "guvenilmez"],
+    Csv.Write(config, "05_concurrency",
+        ["run_id", "model", "concurrency", "total_output_tokens", "wall_clock_sec",
+         "total_tok_per_sec", "p50_latency_ms", "p95_latency_ms", "req_per_sec", "error_count",
+         "successful_requests", "error_kinds", "unreliable"],
         rows);
 }
 
 
 // ============================================================================
-// DENEY 6 — Kalite spot kontrolü
+// EXPERIMENT 6 — Quality spot check
 //
-// Lokal inference bedava değil; kalite ödüyorsun. Bu deney otomatik SKOR
-// üretmiyor — bilinçli olarak. Faz 3-4'te gerçek eval harness'ı kuracaksın;
-// burada amaç çıktıları diske dökmek ve elle okumak.
+// Local inference is not free; you pay in quality. This experiment does NOT
+// produce an automatic SCORE — deliberately. You will build a real eval harness
+// in phases 3-4; the goal here is to dump the outputs to disk and read them by
+// hand.
 //
-// v2: düşünme AÇIK ve KAPALI iki koşu. Reasoning'in kaliteye katkısı ile
-// maliyeti (reasoning token'ları output tarafında sayılır, yani en pahalı
-// taraf) yan yana görünsün.
+// v2: two runs, thinking ON and OFF, so that reasoning's contribution to
+// quality and its cost (reasoning tokens are counted on the output side, i.e.
+// the expensive side) sit side by side.
 // ============================================================================
 static async Task Experiment6_QualitySpotCheck(LmClient client, Config config, string runId)
 {
-    Header("DENEY 6 — Kalite spot kontrolü (elle değerlendirilecek)");
+    Header("EXPERIMENT 6 — Quality spot check (to be assessed by hand)");
 
     var prompts = new[]
     {
-        "Hakediş raporu ile kesin hesap arasındaki fark nedir?",
-        "Fiyat farkı hesaplamasında kullanılan temel endeks nedir ve neden gereklidir?",
-        "İş artışı sözleşme bedelinin yüzde kaçına kadar yapılabilir?",
-        "Geçici kabul ile kesin kabul arasında hangi süre işler?",
-        "Yükleniciye ödenen avansın teminatı nasıl çözülür?",
-        "Bir hakediş dosyasında hangi ekler bulunur? Liste halinde yaz.",
-        "Aşağıdaki metinden sözleşme bedelini ve tarihini JSON olarak çıkar: " +
-        "\"08.03.2026 tarihli sözleşme kapsamında 12.450.000,00 TL bedelle iş üstlenilmiştir.\" " +
-        "Sadece JSON döndür, açıklama yazma.",
-        "Bilmediğin bir mevzuat maddesi sorulursa ne yaparsın? Kısa cevap ver.",
+        "What is the difference between a progress payment report and a final account?",
+        "Which base index is used in the price difference calculation, and why is it needed?",
+        "Up to what percentage of the contract price can a work increase be made?",
+        "What period runs between provisional acceptance and final acceptance?",
+        "How is the guarantee for an advance paid to the contractor released?",
+        "Which annexes are found in a progress payment file? Write them as a list.",
+        "Extract the contract price and the date from the following text as JSON: " +
+        "\"Under the contract dated 08.03.2026, the work was undertaken for a price of 12,450,000.00 TRY.\" " +
+        "Return only JSON, no explanation.",
+        "What do you do if you are asked about a regulation article you do not know? Answer briefly.",
     };
 
     var sb = new StringBuilder();
-    sb.AppendLine($"# Kalite spot kontrolü — {client.ModelId} — {runId}");
+    sb.AppendLine($"# Quality spot check — {client.ModelId} — {runId}");
     sb.AppendLine();
-    sb.AppendLine("Her cevabı elle değerlendir: [D]oğru / [K]ısmen / [Y]anlış / [H]alüsinasyon");
+    sb.AppendLine("Assess each answer by hand: [C]orrect / [P]artial / [W]rong / [H]allucination");
     sb.AppendLine();
-    sb.AppendLine("Not: bu model mevzuat üzerine eğitilmedi. Amaç RAG ÖNCESİ taban çizgisini");
-    sb.AppendLine("görmek — hatalar beklenen sonuçtur ve RAG'in neden gerekli olduğunun kanıtıdır.");
+    sb.AppendLine("Note: this model was not trained on the regulations. The goal is to see the");
+    sb.AppendLine("baseline BEFORE RAG — errors are the expected result and are the evidence for");
+    sb.AppendLine("why RAG is needed.");
     sb.AppendLine();
-    sb.AppendLine("Her soru iki kez soruluyor: düşünme AÇIK ve KAPALI. Reasoning token'ları");
-    sb.AppendLine("output tarafında sayılır (en pahalı taraf), o yüzden kalite katkısının");
-    sb.AppendLine("maliyeti hak edip etmediği ölçülebilir bir sorudur.");
+    sb.AppendLine("Each question is asked twice: with thinking ON and OFF. Reasoning tokens are");
+    sb.AppendLine("counted on the output side (the expensive side), so whether the quality gain");
+    sb.AppendLine("is worth the cost is a measurable question.");
     sb.AppendLine();
 
-    // Düşünme gerçekten kapanmıyorsa iki kol AYNI isteği gönderir ve deney
-    // hiçbir şey ölçmez. Bunu baştan söyleyip çıktıya damgalıyoruz — eski
-    // koşularda iki kolun token sayıları birebir aynı çıkıyordu ve fark
-    // yalnızca dosyayı elle okuyunca görülüyordu.
+    // If thinking really is not being disabled, the two arms send the SAME
+    // request and the experiment measures nothing. We say so up front and stamp
+    // it into the output — in older runs the two arms produced byte-identical
+    // token counts and the problem was only visible when reading the file by hand.
     if (!client.CanDisableThinking)
     {
-        Console.WriteLine("UYARI: düşünme kapatılamıyor (ön kontrol). Tek kol koşulacak;");
-        Console.WriteLine("       'acik' / 'kapali' karşılaştırması bu koşuda yapılmayacak.");
-        sb.AppendLine("> **UYARI:** Ön kontrolde düşünme kapatılamadı. Aşağıdaki çıktılar tek");
-        sb.AppendLine("> kola aittir; açık/kapalı kalite-maliyet karşılaştırması YAPILMAMIŞTIR.");
-        sb.AppendLine("> isteği gönderiyor; token sayılarının birebir aynı çıkması beklenen");
-        sb.AppendLine("> sonuçtur ve bir kalite/maliyet karşılaştırması DEĞİLDİR.");
+        Console.WriteLine("WARNING: thinking cannot be disabled (pre-flight check). A single arm will run;");
+        Console.WriteLine("         the 'on' / 'off' comparison will not be made in this run.");
+        sb.AppendLine("> **WARNING:** thinking could not be disabled in the pre-flight check. The");
+        sb.AppendLine("> outputs below belong to a single arm; the on/off quality-cost comparison");
+        sb.AppendLine("> HAS NOT BEEN MADE. Both arms would send the identical request, so identical");
+        sb.AppendLine("> token counts are the expected result and are NOT a quality/cost comparison.");
         sb.AppendLine();
     }
 
@@ -1076,7 +1110,7 @@ static async Task Experiment6_QualitySpotCheck(LmClient client, Config config, s
     {
         Console.WriteLine($"  [{i + 1}/{prompts.Length}] {Trunc(prompts[i], 50)}");
 
-        sb.AppendLine($"## Soru {i + 1}");
+        sb.AppendLine($"## Question {i + 1}");
         sb.AppendLine($"**Prompt:** {prompts[i]}");
         sb.AppendLine();
 
@@ -1084,13 +1118,14 @@ static async Task Experiment6_QualitySpotCheck(LmClient client, Config config, s
 
         foreach (var think in arms)
         {
-            var label = think ? "düşünme AÇIK" : "düşünme KAPALI";
+            var label = think ? "thinking ON" : "thinking OFF";
             var r = await client.ChatAsync([new Message("user", prompts[i])],
                 3000, 0, seed: 42, disableThinking: !think);
 
-            // max_tokens reasoning + content TOPLAMINI kapsıyor. Bütçe düşünmeye
-            // gidip content'e hiç sıra gelmediğinde bu bir "hata" değil, bir
-            // BÜTÇE olayıdır; ikisini aynı etikete koymak yanlış teşhis üretiyordu.
+            // max_tokens covers the SUM of reasoning + content. When the budget
+            // goes to thinking and content never gets a turn, that is not an
+            // "error" but a BUDGET event; putting both under the same label
+            // produced a wrong diagnosis.
             var truncated = r.FinishReason == "length";
             var body = r.Text.Trim();
 
@@ -1101,17 +1136,17 @@ static async Task Experiment6_QualitySpotCheck(LmClient client, Config config, s
             {
                 sb.AppendLine(body);
                 if (truncated)
-                    sb.AppendLine("\n_(max_tokens tavanında kesildi — cevap eksik)_");
+                    sb.AppendLine("\n_(cut at the max_tokens ceiling — the answer is incomplete)_");
             }
             else if (truncated)
             {
-                sb.AppendLine($"_(görünür cevap YOK — {r.ReasoningTokens} token'lık bütçenin tamamı " +
-                              "düşünmeye gitti ve max_tokens tavanına dayandı; bu bir hata değil, " +
-                              "bütçe olayıdır)_");
+                sb.AppendLine($"_(NO visible answer — the entire {r.ReasoningTokens}-token budget went to " +
+                              "thinking and hit the max_tokens ceiling; this is not an error, it is a " +
+                              "budget event)_");
             }
             else
             {
-                sb.AppendLine("_(boş çıktı — hata)_");
+                sb.AppendLine("_(empty output — error)_");
             }
 
             sb.AppendLine();
@@ -1119,11 +1154,12 @@ static async Task Experiment6_QualitySpotCheck(LmClient client, Config config, s
                           $"(reasoning: {r.ReasoningTokens}) — {r.TotalMs:F0} ms — finish: {r.FinishReason}*");
             sb.AppendLine();
 
-            // Reasoning metni hiç diske yazılmıyordu; "1016 token düşünüp yanlış
-            // cevap verdi" gibi bir iddia çıktı dosyalarından doğrulanamıyordu.
+            // The reasoning text was never written to disk; a claim like "it
+            // thought for 1016 tokens and still answered wrongly" could not be
+            // verified from the output files.
             if (r.Reasoning.Length > 0)
             {
-                sb.AppendLine("<details><summary>reasoning (" + r.Reasoning.Length + " karakter)</summary>");
+                sb.AppendLine("<details><summary>reasoning (" + r.Reasoning.Length + " characters)</summary>");
                 sb.AppendLine();
                 sb.AppendLine("```");
                 sb.AppendLine(r.Reasoning.Trim());
@@ -1133,10 +1169,10 @@ static async Task Experiment6_QualitySpotCheck(LmClient client, Config config, s
                 sb.AppendLine();
             }
 
-            sb.AppendLine("**Değerlendirme:** _(D/K/Y/H — elle doldur)_");
+            sb.AppendLine("**Assessment:** _(C/P/W/H — fill in by hand)_");
             sb.AppendLine();
 
-            rows.Add([runId, client.ModelId, (i + 1).ToString(), think ? "acik" : "kapali",
+            rows.Add([runId, client.ModelId, (i + 1).ToString(), think ? "on" : "off",
                       r.PromptTokens.ToString(), r.CompletionTokens.ToString(),
                       r.ReasoningTokens.ToString(), Inv(r.TotalMs, "F0"),
                       r.Text.Length.ToString(), "",
@@ -1149,19 +1185,19 @@ static async Task Experiment6_QualitySpotCheck(LmClient client, Config config, s
         sb.AppendLine();
     }
 
-    // Elle doldurulan değerlendirmeleri EZMİYORUZ. Eskiden aynı ada
-    // File.WriteAllText yapılıyordu ve ikinci koşu saatlerce süren insan
-    // emeğini uyarısız siliyordu.
-    var path = WriteTextOutput(config, "06_kalite_spot_kontrolu.md", sb.ToString(), runId);
+    // We do NOT overwrite hand-filled assessments. It used to call
+    // File.WriteAllText on the same name, and a second run silently destroyed
+    // hours of human effort.
+    var path = WriteTextOutput(config, "06_quality_spot_check.md", sb.ToString(), runId);
 
-    Csv.Write(config, "06_kalite_metrik",
-        ["run_id", "model", "soru_no", "dusunme", "prompt_tokens", "completion_tokens",
-         "reasoning_tokens", "total_ms", "cevap_karakter", "degerlendirme",
-         "reasoning_karakter", "finish_reason", "max_tokens_kesilen", "dusunme_kapatilabildi"],
+    Csv.Write(config, "06_quality_metrics",
+        ["run_id", "model", "question_no", "thinking", "prompt_tokens", "completion_tokens",
+         "reasoning_tokens", "total_ms", "answer_chars", "assessment",
+         "reasoning_chars", "finish_reason", "max_tokens_truncated", "thinking_could_be_disabled"],
         rows);
 
-    Console.WriteLine($"\nÇıktı: {path}");
-    Console.WriteLine("Bu dosyayı elle doldur. Faz 3 eval veri setinin tohumu olacak.");
+    Console.WriteLine($"\nOutput: {path}");
+    Console.WriteLine("Fill this file in by hand. It will be the seed of the phase 3 eval data set.");
 
     if (client.CanDisableThinking)
     {
@@ -1171,19 +1207,19 @@ static async Task Experiment6_QualitySpotCheck(LmClient client, Config config, s
                             .Count(same => same);
 
         if (identical > 0)
-            Console.WriteLine($"UYARI: {identical}/{prompts.Length} soruda iki kol birebir aynı " +
-                              "sonucu verdi — düşünme kapandığı sanılıyor ama kapanmıyor.");
+            Console.WriteLine($"WARNING: on {identical}/{prompts.Length} questions the two arms produced " +
+                              "byte-identical results — thinking is believed to be off but is not.");
     }
     else
     {
-        Console.WriteLine("NOT: düşünme kapatılamadığı için tek kol koşuldu; " +
-                          "açık/kapalı karşılaştırması bu koşuda YAPILMADI.");
+        Console.WriteLine("NOTE: only one arm was run because thinking could not be disabled; " +
+                          "the on/off comparison WAS NOT MADE in this run.");
     }
 }
 
 
 // ============================================================================
-// Yardımcılar
+// Helpers
 // ============================================================================
 
 static void Header(string title)
@@ -1196,15 +1232,16 @@ static void Header(string title)
 
 static string Inv(double v, string fmt) => v.ToString(fmt, CultureInfo.InvariantCulture);
 
-static string Fmt(double ttft) => ttft < 0 ? "yok" : $"{ttft:F0}ms";
+static string Fmt(double ttft) => ttft < 0 ? "n/a" : $"{ttft:F0}ms";
 
 static string Trunc(string s, int max) => Text.Trunc(s, max);
 
 /// <summary>
-/// Metin çıktısını yazar ama VAR OLANI EZMEZ. Deney 3'ün örnekleri ve Deney 6'nın
-/// Markdown'ı elle doldurulan alanlar içeriyor; sabit ada File.WriteAllText yapmak
-/// ikinci koşuda insan emeğini uyarısız siliyordu. Dosya varsa run_id'li bir
-/// kardeş dosyaya yazıp yolu döndürüyoruz.
+/// Writes a text output but DOES NOT OVERWRITE an existing one. Experiment 3's
+/// samples and Experiment 6's Markdown contain hand-filled fields; calling
+/// File.WriteAllText on a fixed name silently destroyed human effort on the
+/// second run. If the file exists we write to a run_id-suffixed sibling and
+/// return that path.
 /// </summary>
 static string WriteTextOutput(Config config, string fileName, string content, string runId)
 {
@@ -1215,24 +1252,29 @@ static string WriteTextOutput(Config config, string fileName, string content, st
         var stem = Path.GetFileNameWithoutExtension(fileName);
         var ext = Path.GetExtension(fileName);
         path = Path.Combine(config.OutputDir, $"{stem}.{runId}{ext}");
-        Console.WriteLine($"   NOT: {fileName} zaten var (elle doldurulmuş olabilir), " +
-                          $"yeni çıktı {Path.GetFileName(path)} olarak yazıldı.");
+        Console.WriteLine($"   NOTE: {fileName} already exists (it may have been filled in by hand), " +
+                          $"the new output was written as {Path.GetFileName(path)}.");
     }
 
     File.WriteAllText(path, content, Encoding.UTF8);
     return path;
 }
 
-// Belirli uzunlukta doldurma metni. Türkçe kullanıyoruz ki prefill ölçümü
-// gerçek kullanım senaryosunu yansıtsın (Deney 1'deki token cezası dahil).
+// Filler text of a given length.
+//
+// NOTE: this vocabulary used to be Turkish on purpose, so that the prefill
+// measurement reflected the real usage scenario (including the token penalty
+// from Experiment 1). It is English now, which makes the prefill/KV-cache
+// measurements cheaper per word than the Turkish workload they stand in for.
 static string Filler(int words)
 {
     var vocab = new[]
     {
-        "yüklenici", "idare", "sözleşme", "hakediş", "imalat", "metraj", "keşif",
-        "birim", "fiyat", "teminat", "şantiye", "ihale", "teknik", "şartname",
-        "kabul", "muayene", "tutanak", "ödeme", "gecikme", "cezai", "şart",
-        "endeks", "avans", "revize", "artış", "azalış", "denetim", "rapor",
+        "contractor", "administration", "contract", "progress payment", "production",
+        "quantity", "estimate", "unit", "price", "guarantee", "site", "tender",
+        "technical", "specification", "acceptance", "inspection", "minutes",
+        "payment", "delay", "penalty", "clause", "index", "advance", "revision",
+        "increase", "decrease", "audit", "report",
     };
 
     var sb = new StringBuilder();
@@ -1246,7 +1288,7 @@ static string Filler(int words)
 
 
 // ============================================================================
-// LM Studio istemcisi (OpenAI-uyumlu /v1)
+// LM Studio client (OpenAI-compatible /v1)
 // ============================================================================
 
 sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
@@ -1254,14 +1296,15 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
     public string ModelId { get; set; } = modelId ?? "";
 
     /// <summary>
-    /// enable_thinking desteklenmiyorsa /no_think sistem mesajı fallback'i.
-    /// Ön kontrol sonucuna göre çalışma zamanında set edilir.
+    /// The /no_think system-message fallback for when enable_thinking is not
+    /// supported. Set at run time based on the pre-flight check result.
     /// </summary>
     public bool UseNoThinkFallback { get; set; }
 
     /// <summary>
-    /// Ön kontrolde düşünmenin gerçekten kapatılabildiği doğrulandı mı?
-    /// Deney 6 buna bakıp "iki kol aynı isteği gönderiyor" uyarısını basıyor.
+    /// Did the pre-flight check confirm that thinking can genuinely be disabled?
+    /// Experiment 6 reads this to emit its "both arms send the same request"
+    /// warning.
     /// </summary>
     public bool CanDisableThinking { get; set; }
 
@@ -1312,12 +1355,12 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
         using var doc = JsonDocument.Parse(raw);
         var root = doc.RootElement;
 
-        // Bazı OpenAI-uyumlu sunucular hatayı 200 ile { "error": ... } gövdesinde
-        // döndürüyor. Stream yolunda bu kontrol vardı, burada yoktu: sonuç boş bir
-        // ChatResult olarak sessizce geçip Deney 1'de "oran 0.000" gibi masum
-        // görünen ama yanlış sayılara dönüşüyordu.
+        // Some OpenAI-compatible servers return an error with HTTP 200 and an
+        // { "error": ... } body. The stream path had this check, this one did
+        // not: the result passed silently as an empty ChatResult and turned into
+        // innocent-looking but wrong numbers such as "ratio 0.000" in Experiment 1.
         if (root.TryGetProperty("error", out var errEl))
-            throw new InvalidOperationException($"sunucu hatası (HTTP 200) — {Text.Trunc(errEl.ToString(), 400)}");
+            throw new InvalidOperationException($"server error (HTTP 200) — {Text.Trunc(errEl.ToString(), 400)}");
 
         var text = "";
         var reasoning = "";
@@ -1327,17 +1370,17 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
         {
             if (choices[0].TryGetProperty("message", out var msg))
             {
-                // Reasoning modelleri burada da ayrı alan kullanıyor.
-                // v1 sadece content'e bakıyordu ve boş string alıyordu.
+                // Reasoning models use a separate field here too.
+                // v1 only looked at content and got the empty string.
                 text = ReadStringProp(msg, "content") ?? "";
                 reasoning = ReadStringProp(msg, "reasoning_content")
                          ?? ReadStringProp(msg, "reasoning")
                          ?? "";
             }
 
-            // finish_reason hiç okunmuyordu: max_tokens tavanında kesilmiş bir
-            // cevap ile normal biten cevap ayırt edilemiyor, budanma "hata" diye
-            // etiketleniyordu.
+            // finish_reason was never read: an answer cut at the max_tokens
+            // ceiling could not be told apart from one that ended normally, and
+            // truncation was labelled an "error".
             finishReason = ReadStringProp(choices[0], "finish_reason") ?? "";
         }
 
@@ -1349,17 +1392,17 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
     // ------------------------------------------------------------------------
     // Streaming
     //
-    // TTFT'yi ölçmenin tek yolu bu — non-stream çağrıda prefill ile decode tek
-    // bir süreye gömülür ve ayrıştırılamaz.
+    // This is the only way to measure TTFT — in a non-stream call prefill and
+    // decode are buried in a single duration and cannot be separated.
     //
-    // Reasoning modellerinde iki ayrı TTFT vardır ve ikisi de anlamlıdır:
-    //   TtftAnyMs     : ilk HERHANGİ bir token. Fiziksel prefill'in bittiği an.
-    //                   Prefill katsayısı hesabında bu kullanılır.
-    //   TtftContentMs : kullanıcıya GÖRÜNEN ilk token. Algılanan gecikme.
-    //                   Timeout bütçesi ve UI kararları buna göre verilir.
+    // Reasoning models have two distinct TTFTs and both are meaningful:
+    //   TtftAnyMs     : the first token OF ANY KIND. The moment physical prefill
+    //                   finished. This is what the prefill coefficient uses.
+    //   TtftContentMs : the first token VISIBLE to the user. Perceived latency.
+    //                   Timeout budgets and UI decisions are made from this one.
     //
-    // Ayırmazsan model saniyelerce "sessiz" düşünür, sen de sağlıklı isteği
-    // timeout sanıp iptal edersin.
+    // Without the distinction, the model thinks "silently" for seconds and you
+    // cancel a healthy request believing it timed out.
     // ------------------------------------------------------------------------
 
     public async Task<StreamResult> ChatStreamAsync(
@@ -1397,13 +1440,13 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
 
         while (await reader.ReadLineAsync() is { } line)
         {
-            if (line.Length == 0) continue;                  // SSE ayırıcı
-            if (!line.StartsWith("data:")) continue;         // ':' sonrası boşluk SSE'de OPSİYONEL
+            if (line.Length == 0) continue;                  // SSE separator
+            if (!line.StartsWith("data:")) continue;         // the space after ':' is OPTIONAL in SSE
 
-            // Eskiden "data: " (boşluklu) sabit prefix'i aranıyor ve line[6..]
-            // ile kesiliyordu; "data:{...}" yayan bir sunucuda TÜM chunk'lar
-            // sessizce düşüyor, ttft ölçülemiyor ve v1'in ttft==total hatası
-            // hiçbir uyarı vermeden geri geliyordu.
+            // It used to look for the fixed prefix "data: " (with a space) and
+            // slice with line[6..]; against a server emitting "data:{...}" ALL
+            // chunks were dropped silently, ttft could not be measured and v1's
+            // ttft==total bug came back without any warning.
             var payload = line[5..].TrimStart();
             if (payload.Length == 0) continue;
             if (payload.AsSpan().Trim().SequenceEqual("[DONE]")) break;
@@ -1412,7 +1455,7 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
 
             JsonDocument doc;
             try { doc = JsonDocument.Parse(payload); }
-            catch (JsonException) { continue; }              // bozuk chunk koşuyu düşürmesin
+            catch (JsonException) { continue; }              // a malformed chunk must not kill the run
 
             using (doc)
             {
@@ -1426,8 +1469,8 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
                     if (choices[0].TryGetProperty("delta", out var delta)
                         && delta.ValueKind == JsonValueKind.Object)
                     {
-                        // --- reasoning kanalı ---
-                        // Farklı sunucular farklı isim kullanıyor; ikisini de tara.
+                        // --- reasoning channel ---
+                        // Different servers use different names; scan for both.
                         var reasoningChunk = ReadStringProp(delta, "reasoning_content")
                                           ?? ReadStringProp(delta, "reasoning");
 
@@ -1437,7 +1480,7 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
                             reasoningSb.Append(reasoningChunk);
                         }
 
-                        // --- görünür içerik kanalı ---
+                        // --- visible content channel ---
                         var contentChunk = ReadStringProp(delta, "content");
                         if (!string.IsNullOrEmpty(contentChunk))
                         {
@@ -1451,7 +1494,8 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
                     if (!string.IsNullOrEmpty(fr)) finishReason = fr;
                 }
 
-                // usage genelde son chunk'ta gelir; her chunk'ta okuyup üzerine yazıyoruz.
+                // usage usually arrives in the last chunk; we read it on every
+                // chunk and overwrite.
                 var (p, c, r) = ReadUsage(root);
                 if (p > 0) pt = p;
                 if (c > 0) ct = c;
@@ -1462,19 +1506,20 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
         sw.Stop();
         var totalMs = sw.Elapsed.TotalMilliseconds;
 
-        // ttftAny = -1 KORUNUYOR. Eskiden totalMs'e düşürülüyordu; bu, dosyanın
-        // başında v1'in ana hatası olarak tarif edilen ttft == total durumunu
-        // bayraksız üretiyor ve regresyona gerçek ölçüm gibi giriyordu.
-        // ttftContent = -1 de aynı sebeple bırakılıyor: hiç görünür içerik
-        // üretilmedi demek. 0 yazmak "anında geldi" gibi okunur ve CSV'yi
-        // sessizce yalanlar. Eksik veriyi eksik olarak kaydet.
+        // ttftAny = -1 IS PRESERVED. It used to be folded down to totalMs, which
+        // reproduced — unflagged — exactly the ttft == total condition described
+        // at the top of this file as v1's main bug, and it entered the regression
+        // as if it were a real measurement.
+        // ttftContent = -1 is left alone for the same reason: it means no visible
+        // content was ever produced. Writing 0 reads as "it arrived instantly"
+        // and silently makes the CSV lie. Record missing data as missing.
 
         if (dataLines == 0)
             throw new InvalidOperationException(
-                "stream'den hiç 'data:' satırı okunamadı — SSE formatı beklenenden farklı.");
+                "not a single 'data:' line could be read from the stream — the SSE format differs from what was expected.");
 
-        // Sunucu usage göndermediyse token sayısını TAHMİN ediyoruz, ama bunu
-        // bayrakla işaretliyoruz: tahmin ile ölçüm CSV'de ayırt edilebilsin.
+        // If the server did not send usage we ESTIMATE the token count, but we
+        // flag it so estimate and measurement stay distinguishable in the CSV.
         var estimated = ct == 0;
         if (estimated)
             ct = Math.Max(1, (contentSb.Length + reasoningSb.Length) / 3);
@@ -1492,8 +1537,8 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
     {
         var effective = messages;
 
-        // Fallback: chat_template_kwargs desteklenmiyorsa Qwen'de /no_think
-        // sistem mesajı da düşünmeyi kapatıyor.
+        // Fallback: if chat_template_kwargs is not supported, the /no_think
+        // system message also turns thinking off on Qwen.
         if (disableThinking && UseNoThinkFallback)
         {
             effective = [.. messages];
@@ -1514,7 +1559,8 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
 
         if (seed.HasValue) body["seed"] = seed.Value;
 
-        // Ölçüm koşularında düşünmeyi kapat: fiziği ölçüyoruz, akıl yürütmeyi değil.
+        // Turn thinking off during measurement runs: we are measuring the
+        // physics, not the reasoning.
         if (disableThinking)
             body["chat_template_kwargs"] = new Dictionary<string, object> { ["enable_thinking"] = false };
 
@@ -1540,9 +1586,9 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
 
         return (p, c, r);
 
-        // GetInt32 korumasızdı: usage alanı "128.0" gibi ondalıklı ya da
-        // int.MaxValue üstü gelirse FormatException atıyor ve bu istisna
-        // aşağıdaki JsonException catch'i tarafından yakalanmıyordu.
+        // GetInt32 was unguarded: if a usage field arrived as a decimal such as
+        // "128.0", or above int.MaxValue, it threw FormatException, and that
+        // exception was not caught by the JsonException catch below.
         static int ReadInt(JsonElement el, string name)
         {
             if (!el.TryGetProperty(name, out var v) || v.ValueKind != JsonValueKind.Number)
@@ -1558,7 +1604,7 @@ sealed class LmClient(HttpClient http, string baseUrl, string? modelId)
 
 
 // ============================================================================
-// Kayıt tipleri
+// Record types
 // ============================================================================
 
 record Message(string Role, string Content);
@@ -1570,7 +1616,7 @@ record ChatResult(
     int CompletionTokens,
     int ReasoningTokens,
     double TotalMs,
-    string FinishReason);   // "stop" | "length" | ... ; "" = sunucu bildirmedi
+    string FinishReason);   // "stop" | "length" | ... ; "" = the server did not report it
 
 record StreamResult(
     string Text,
@@ -1578,19 +1624,20 @@ record StreamResult(
     int PromptTokens,
     int CompletionTokens,
     int ReasoningTokens,
-    double TtftAnyMs,       // -1 = hiç token gelmedi, ölçülemedi
-    double TtftContentMs,   // -1 = hiç görünür içerik üretilmedi
+    double TtftAnyMs,       // -1 = no token ever arrived, could not be measured
+    double TtftContentMs,   // -1 = no visible content was ever produced
     double TotalMs,
     string FinishReason,
-    bool CompletionTokensEstimated);   // true = sunucu usage göndermedi, TAHMİN
+    bool CompletionTokensEstimated);   // true = the server sent no usage, this is an ESTIMATE
 
 
 // ============================================================================
-// İstatistik
+// Statistics
 //
-// Medyan kullanıyoruz, ortalama değil: GPU'da Windows masaüstü kompozisyonu
-// veya termal throttle arada spike yaratır ve ortalamayı bozar. p95'i ayrıca
-// raporluyoruz çünkü kuyruk latency'si kapasite kararının asıl girdisi.
+// We use the median, not the mean: on a GPU, Windows desktop composition or
+// thermal throttling produces occasional spikes that distort the mean. We also
+// report p95 separately because tail latency is the real input to the capacity
+// decision.
 // ============================================================================
 
 static class Stats
@@ -1612,7 +1659,7 @@ static class Stats
         return s[Math.Clamp(idx, 0, s.Length - 1)];
     }
 
-    /// <summary>En küçük kareler doğrusal uyum. Dönüş: (eğim, kesişim).</summary>
+    /// <summary>Least-squares linear fit. Returns: (slope, intercept).</summary>
     public static (double Slope, double Intercept) LinearFit(IEnumerable<double> xs, IEnumerable<double> ys)
     {
         var x = xs.ToArray();
@@ -1629,9 +1676,10 @@ static class Stats
     }
 
     /// <summary>
-    /// Belirlilik katsayısı. LinearFit tek başına uyumun İYİ olup olmadığını
-    /// söylemiyordu: den ~ 0 iken sessizce eğim 0 dönüyor ve bu değer gerçek
-    /// ölçüm gibi raporlanıyordu. Katsayıyı R² ile birlikte bas.
+    /// Coefficient of determination. LinearFit alone did not say whether the fit
+    /// was GOOD: when den ~ 0 it silently returned a slope of 0, and that value
+    /// was reported as if it were a real measurement. Print the coefficient
+    /// together with R².
     /// </summary>
     public static double RSquared(IEnumerable<double> xs, IEnumerable<double> ys, double slope, double intercept)
     {
@@ -1650,7 +1698,7 @@ static class Stats
 
 
 // ============================================================================
-// Metin yardımcıları
+// Text helpers
 // ============================================================================
 
 static class Text
@@ -1659,8 +1707,8 @@ static class Text
     {
         if (string.IsNullOrEmpty(s) || s.Length <= max) return s ?? "";
 
-        // UTF-16 kod birimiyle kesmek surrogate çiftini bölebilir; sınırı bir
-        // birim geri alıp yarım karakter üretmiyoruz.
+        // Cutting on a UTF-16 code unit can split a surrogate pair; we pull the
+        // boundary back by one unit so we never produce half a character.
         var cut = max;
         if (char.IsHighSurrogate(s[cut - 1])) cut--;
 
@@ -1676,13 +1724,14 @@ static class Text
 static class Csv
 {
     /// <summary>
-    /// Aynı ada VARSA satırları ekler, üzerine yazmaz. Her satırda run_id
-    /// olduğu için koşular gerçekten karşılaştırılabilir hale geliyor —
-    /// eskiden File.WriteAllText ile her koşu bir öncekini uyarısız siliyor,
-    /// buna rağmen "koşular karşılaştırılabilir" deniyordu.
+    /// If a file of the same name EXISTS it appends rows rather than
+    /// overwriting. Because every row carries a run_id, runs genuinely become
+    /// comparable — previously File.WriteAllText meant each run silently deleted
+    /// the previous one, while the code still claimed "runs are comparable".
     ///
-    /// Başlık değiştiyse (şema güncellendi) eski dosyaya eklemek veriyi
-    /// bozar; o durumda eskisi .bak olarak saklanıp yeni dosya açılıyor.
+    /// If the header changed (the schema was updated), appending to the old file
+    /// would corrupt the data; in that case the old one is kept as .bak and a new
+    /// file is started.
     /// </summary>
     public static void Write(Config config, string name, string[] header, List<string[]> rows)
     {
@@ -1702,7 +1751,7 @@ static class Csv
             {
                 var backup = path + ".bak";
                 File.Move(path, backup, overwrite: true);
-                Console.WriteLine($"   NOT: {name}.csv şeması değişmiş, eskisi {name}.csv.bak olarak saklandı.");
+                Console.WriteLine($"   NOTE: the schema of {name}.csv changed, the old one was kept as {name}.csv.bak.");
             }
         }
 
@@ -1710,26 +1759,27 @@ static class Csv
         if (!append) sb.AppendLine(headerLine);
         foreach (var r in rows) sb.AppendLine(string.Join(",", r.Select(Escape)));
 
-        // BOM: Excel Türkçe karakterleri doğru okusun.
+        // BOM: so that Excel reads non-ASCII characters correctly.
         if (append)
             File.AppendAllText(path, sb.ToString(), new UTF8Encoding(true));
         else
             File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
 
-        Console.WriteLine($"-> {path}{(append ? $" (+{rows.Count} satır eklendi)" : "")}");
+        Console.WriteLine($"-> {path}{(append ? $" (+{rows.Count} rows appended)" : "")}");
     }
 
     static string Escape(string v)
     {
         v ??= "";
 
-        // '\r' de tırnaklanmalı: tek başına gelen bir CR, BOM'lu (Excel hedefli)
-        // dosyada satır yapısını bozuyordu.
+        // '\r' must be quoted too: a lone CR corrupted the line structure in a
+        // BOM-prefixed (Excel-targeted) file.
         var needsQuote = v.Contains(',') || v.Contains('"') || v.Contains('\n') || v.Contains('\r');
 
-        // Formül enjeksiyonu: '=', '+', '-', '@' ile başlayan hücreleri Excel
-        // formül sanıyor. ModelId ve elle doldurulan kolonlar sunucudan/insandan
-        // geliyor, tırnak içine alıp başına ' koyarak nötrleştiriyoruz.
+        // Formula injection: Excel treats cells starting with '=', '+', '-' or
+        // '@' as formulas. ModelId and the hand-filled columns come from the
+        // server or from a human, so we neutralize them by quoting and prefixing
+        // with an apostrophe.
         if (v.Length > 0 && (v[0] is '=' or '+' or '@'))
             return "\"'" + v.Replace("\"", "\"\"") + "\"";
 
@@ -1739,7 +1789,7 @@ static class Csv
 
 
 // ============================================================================
-// Konfigürasyon
+// Configuration
 // ============================================================================
 
 sealed class Config
@@ -1751,13 +1801,14 @@ sealed class Config
     public HashSet<int> Experiments { get; init; } = [1, 2, 3, 4, 5, 6];
 
     public const string Usage =
-        "Kullanım: dotnet run -- [--url <adres>] [--model <id>] [--out <klasör>] " +
-        "[--doc-words <sayı>] [1..6 ...]";
+        "Usage: dotnet run -- [--url <address>] [--model <id>] [--out <directory>] " +
+        "[--doc-words <count>] [1..6 ...]";
 
     /// <summary>
-    /// Argüman ayrıştırma. Tanınmayan her şey artık HATA: '--modle qwen' gibi bir
-    /// yazım hatası sessizce yutulup otomatik model keşfine düşürüyordu, 'dotnet
-    /// run -- 7' ise hiçbir deney seçmediği için hepsini koşturuyordu.
+    /// Argument parsing. Anything unrecognized is now an ERROR: a typo such as
+    /// '--modle qwen' used to be swallowed silently and fall through to
+    /// auto-discovery, while 'dotnet run -- 7' selected no experiment at all and
+    /// therefore ran all of them.
     /// </summary>
     public static Config Parse(string[] args)
     {
@@ -1780,7 +1831,7 @@ sealed class Config
                 case "--doc-words":
                     if (i + 1 >= args.Length)
                     {
-                        errors.Add($"{arg} bir değer bekliyor ama argüman listesi bitti");
+                        errors.Add($"{arg} expects a value but the argument list ended");
                         break;
                     }
 
@@ -1790,7 +1841,7 @@ sealed class Config
                     else if (arg == "--model") model = value;
                     else if (arg == "--out") outDir = value;
                     else if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out docWords) || docWords < 1)
-                        errors.Add($"--doc-words pozitif bir tamsayı olmalı, '{value}' geldi");
+                        errors.Add($"--doc-words must be a positive integer, got '{value}'");
 
                     break;
 
@@ -1798,11 +1849,11 @@ sealed class Config
                     if (int.TryParse(arg, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n))
                     {
                         if (n is >= 1 and <= 6) exps.Add(n);
-                        else errors.Add($"deney numarası 1-6 aralığında olmalı, '{n}' geldi");
+                        else errors.Add($"the experiment number must be in the range 1-6, got '{n}'");
                     }
                     else
                     {
-                        errors.Add($"tanınmayan argüman: '{arg}'");
+                        errors.Add($"unrecognized argument: '{arg}'");
                     }
 
                     break;
@@ -1810,7 +1861,7 @@ sealed class Config
         }
 
         if (errors.Count > 0)
-            throw new ArgumentException(string.Join("\n  - ", errors.Prepend("Argüman hatası:")));
+            throw new ArgumentException(string.Join("\n  - ", errors.Prepend("Argument error:")));
 
         return new Config
         {
