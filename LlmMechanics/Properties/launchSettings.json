@@ -1,0 +1,14 @@
+{
+  "profiles": {
+    "Step 1": {
+      "commandName": "Project",
+      "commandLineArgs": "1 --model qwen/qwen3.5-9b",
+      "workingDirectory": "$(ProjectDir)"
+    },
+    "Step 2": {
+      "commandName": "Project",
+      "commandLineArgs": "2 --model qwen/qwen3.5-9b",
+      "workingDirectory": "$(ProjectDir)"
+    }
+  }
+}
