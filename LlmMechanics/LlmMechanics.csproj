@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <Folder Include="results\" />
+    <Folder Include="results\step2\" />
   </ItemGroup>
 
 </Project>

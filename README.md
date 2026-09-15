@@ -29,9 +29,9 @@ That decision is in [ADR-0004](../../docs/adr/0004-local-inference-lm-studio.md)
 | Date | 2026-09-09 |
 
 Measurement tool: a dependency-free single-file C# console application
-(`LlmMechanics/Program.cs`). A raw `HttpClient` is used; an SDK/abstraction was
-deliberately avoided, because an abstraction normalizes exactly the provider
-differences we want to measure.
+(`LlmMechanics/StepOne.cs`, started through `Program.cs`). A raw `HttpClient` is
+used; an SDK/abstraction was deliberately avoided, because an abstraction
+normalizes exactly the provider differences we want to measure.
 
 ### Methodology
 
@@ -433,11 +433,14 @@ The measurement tool is itself part of the system being measured.
 
 ## Running it
 
+The first argument selects the phase (`1` for this one); everything after it is
+passed to the phase unchanged.
+
 ```bash
 cd LlmMechanics
-dotnet run -- --model qwen/qwen3.5-9b            # all experiments
-dotnet run -- --model qwen/qwen3.5-9b 2 4        # selected experiments
-dotnet run -- --model qwen/qwen3.5-9b --doc-words 1000
+dotnet run -- 1 --model qwen/qwen3.5-9b            # all experiments
+dotnet run -- 1 --model qwen/qwen3.5-9b 2 4        # selected experiments
+dotnet run -- 1 --model qwen/qwen3.5-9b --doc-words 1000
 ```
 
 Outputs are written under `results/`. Every row is stamped with a `run_id` and, if
